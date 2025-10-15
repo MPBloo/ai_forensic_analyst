@@ -855,14 +855,18 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             "weight": 1.0
         },
         "weapons": {
-            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm"],
+            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm", "cutting"],
             "vqa_questions": [
                 "Is there a knife, blade, or sharp cutting tool visible in this image?",
-                "Can you see a gun, firearm, rifle, or pistol?"
+                "Can you see a gun, firearm, rifle, or pistol?",
+                "What tool or implement is being used or held in this image?",
+                "Are there any weapons, blades, or sharp metallic objects?"
             ],
-            "weight": 1.2,  # Poids réduit légèrement
-            # Liste d'exclusion pour éviter faux positifs
-            "exclude_keywords": ["dog", "cat", "animal", "pet", "food", "fruit", "vegetable", "phone", "bottle"]
+            "weight": 1.2,
+            # Liste d'exclusion STRICTE pour éviter faux positifs
+            "exclude_keywords": ["dog", "cat", "pet", "animal", "bird", "horse"],
+            # Si SEULEMENT ces mots apparaissent (sans knife/gun/blade), alors exclure
+            "exclude_only_if_alone": True
         },
         "documents": {
             "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
@@ -942,11 +946,25 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                 
                 # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
                 exclude_list = config.get("exclude_keywords", [])
-                if exclude_list and any(excluded in vqa_lower for excluded in exclude_list):
-                    print(f"  → Q{i+1} Excluded (faux positif détecté: {[e for e in exclude_list if e in vqa_lower]})")
-                    has_exclusion = True
-                    score -= 15  # Pénalité forte
-                    continue
+                if exclude_list:
+                    # Vérifier si des mots d'exclusion sont présents
+                    excluded_found = [e for e in exclude_list if e in vqa_lower]
+                    
+                    if excluded_found:
+                        # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
+                        weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
+                        has_weapon_word = any(w in vqa_lower for w in weapon_words)
+                        
+                        # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
+                        if not has_weapon_word and config.get("exclude_only_if_alone", False):
+                            print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
+                            has_exclusion = True
+                            score -= 20  # Pénalité
+                            continue
+                        elif not has_weapon_word:
+                            # Petite pénalité mais pas exclusion totale
+                            score -= 5
+                            print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
                 
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
@@ -990,7 +1008,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     # 4. Sélection des catégories avec seuil adaptatif
     # Seuils différents selon la catégorie pour éviter faux positifs
     category_thresholds = {
-        "weapons": 35,      # Seuil PLUS ÉLEVÉ pour weapons (éviter faux positifs)
+        "weapons": 30,      # Seuil modéré pour weapons (équilibre détection/précision)
         "people": 20,
         "vehicles": 20,
         "documents": 20,
