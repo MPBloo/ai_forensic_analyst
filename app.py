@@ -816,105 +816,156 @@ def ask_vqa_question(image: Image.Image, question: str) -> str:
 def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     """
     Classifie une image dans une ou plusieurs catégories de manière interprétative
-    Utilise description + VQA + analyse sémantique pour classification intelligente
+    AMÉLIORÉ : Utilise PLUSIEURS questions VQA détaillées par catégorie
     Retourne une liste de catégories (multi-catégories possible)
     """
     image = image_data["image"]
     categories_assigned = []
     
-    # 1. Obtenir la description de l'image (déjà générée normalement)
+    # 1. Obtenir la description de l'image
     description = generate_caption(image).lower()
     print(f"\n=== Analyzing image {image_id} ===")
     print(f"Description: {description}")
     
-    # 2. Analyse sémantique basée sur la description + VQA
-    # Chaque catégorie a des indicateurs sémantiques variés
+    # 2. Configuration des catégories avec QUESTIONS MULTIPLES détaillées
     category_analysis = {
         "people": {
             "keywords": ["person", "man", "woman", "people", "child", "boy", "girl", "human", "face", "crowd", "group"],
-            "vqa_question": "Are there any people, persons, or human beings visible in this image?",
+            "vqa_questions": [
+                "Are there any people, persons, or human beings visible in this image?",
+                "Can you see a man, woman, or child in this picture?",
+                "Is there a human face or body visible?"
+            ],
             "weight": 1.0
         },
         "vehicles": {
             "keywords": ["car", "vehicle", "truck", "motorcycle", "bike", "bus", "train", "automobile", "taxi", "van"],
-            "vqa_question": "Can you see any vehicles, cars, or means of transportation?",
+            "vqa_questions": [
+                "Can you see any vehicles, cars, or means of transportation?",
+                "Is there a car, truck, motorcycle, or bicycle in this image?",
+                "Are there any wheels or vehicle parts visible?"
+            ],
             "weight": 1.0
         },
         "weapons": {
-            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "dangerous"],
-            "vqa_question": "Does this contain any weapons or dangerous objects?",
-            "weight": 1.2  # Plus de poids pour sécurité
+            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "dangerous", "cutting", "sharp"],
+            "vqa_questions": [
+                "Is there a knife, blade, or sharp cutting tool visible in this image?",
+                "Can you see a gun, firearm, rifle, or pistol?",
+                "What tool or object is the person holding or using?",
+                "Are there any sharp objects, blades, or potentially dangerous items?"
+            ],
+            "weight": 1.3  # Poids élevé pour sécurité
         },
         "documents": {
-            "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card"],
-            "vqa_question": "Is there any text, document, paper, or written content visible?",
+            "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
+            "vqa_questions": [
+                "Is there any text, document, or written content visible?",
+                "Can you see any words, letters, or writing in this image?",
+                "Are there any signs, papers, or documents?"
+            ],
             "weight": 1.0
         },
         "buildings": {
             "keywords": ["building", "house", "structure", "architecture", "wall", "door", "window", "roof", "facade"],
-            "vqa_question": "Can you see any buildings, houses, or architectural structures?",
+            "vqa_questions": [
+                "Can you see any buildings, houses, or architectural structures?",
+                "Is there a wall, door, window, or building structure visible?",
+                "Is this image taken in front of or inside a building?"
+            ],
             "weight": 1.0
         },
         "outdoor": {
             "keywords": ["outdoor", "outside", "street", "road", "park", "sky", "nature", "exterior", "sidewalk"],
-            "vqa_question": "Is this an outdoor scene or taken outside?",
+            "vqa_questions": [
+                "Is this an outdoor scene or taken outside?",
+                "Can you see the sky, street, or outdoor environment?"
+            ],
             "weight": 0.8
         },
         "indoor": {
             "keywords": ["indoor", "inside", "room", "interior", "ceiling", "floor", "furniture", "wall"],
-            "vqa_question": "Is this an indoor scene or taken inside a building?",
+            "vqa_questions": [
+                "Is this an indoor scene or taken inside a building?",
+                "Can you see a room, ceiling, or interior space?"
+            ],
             "weight": 0.8
         },
         "objects": {
-            "keywords": ["object", "item", "thing", "tool", "equipment", "device", "bag", "box", "bottle"],
-            "vqa_question": "Are there any specific objects, items, or things in this image?",
-            "weight": 0.7  # Moins de poids car très général
+            "keywords": ["object", "item", "thing", "tool", "equipment", "device", "bag", "box", "bottle", "holding"],
+            "vqa_questions": [
+                "Are there any specific objects, items, or things in this image?",
+                "What objects or items can you see in this picture?"
+            ],
+            "weight": 0.7
         }
     }
     
-    # 3. Scorer chaque catégorie de manière intelligente
+    # 3. Scorer chaque catégorie de manière intelligente avec QUESTIONS MULTIPLES
     category_scores = {}
     
     for category, config in category_analysis.items():
         score = 0.0
         
-        # A. Analyse des mots-clés dans la description (sémantique)
+        # A. Analyse des mots-clés dans la description
         keyword_matches = sum(1 for keyword in config["keywords"] if keyword in description)
         if keyword_matches > 0:
             score += (keyword_matches * 20) * config["weight"]
             print(f"{category}: Found {keyword_matches} keyword(s) in description")
         
-        # B. Question VQA pour confirmation
-        vqa_answer = ask_vqa_question(image, config["vqa_question"])
-        print(f"{category} VQA: '{vqa_answer}'")
+        # B. Poser TOUTES les questions VQA pour cette catégorie
+        positive_answers = 0
+        total_questions = len(config["vqa_questions"])
         
-        # Analyse de la réponse VQA de manière plus nuancée
-        if vqa_answer:
-            vqa_lower = vqa_answer.lower()
-            # Réponses positives
-            if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see"]):
-                score += 30 * config["weight"]
-                print(f"  → VQA positive (+{30 * config['weight']:.1f})")
-            # Réponses négatives
-            elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't"]):
-                score -= 10
-                print(f"  → VQA negative (-10)")
-            # Réponses contenant des éléments de la catégorie
-            elif any(keyword in vqa_lower for keyword in config["keywords"][:5]):
-                score += 25 * config["weight"]
-                print(f"  → VQA mentions category (+{25 * config['weight']:.1f})")
+        for i, question in enumerate(config["vqa_questions"]):
+            vqa_answer = ask_vqa_question(image, question)
+            print(f"{category} VQA Q{i+1}/{total_questions}: '{vqa_answer}'")
+            
+            if vqa_answer:
+                vqa_lower = vqa_answer.lower()
+                
+                # Réponses positives claires
+                if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
+                    positive_answers += 1
+                    score += 25 * config["weight"]
+                    print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
+                
+                # Réponses négatives claires
+                elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't", "nothing"]):
+                    score -= 5
+                    print(f"  → Q{i+1} Negative (-5)")
+                
+                # Réponses contenant des éléments de la catégorie (détection implicite)
+                elif any(keyword in vqa_lower for keyword in config["keywords"][:8]):
+                    positive_answers += 0.5
+                    score += 20 * config["weight"]
+                    print(f"  → Q{i+1} Mentions category (+{20 * config['weight']:.1f})")
+                
+                # Réponses descriptives (ex: "knife", "cutting tool")
+                else:
+                    # Vérifier si la réponse contient des mots pertinents
+                    answer_words = vqa_lower.split()
+                    if any(word in answer_words for word in config["keywords"][:10]):
+                        positive_answers += 0.3
+                        score += 15 * config["weight"]
+                        print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
+        
+        # Bonus si plusieurs questions confirment la catégorie
+        if positive_answers >= 2:
+            bonus = 20 * config["weight"]
+            score += bonus
+            print(f"  → Multiple confirmations bonus (+{bonus:.1f})")
         
         category_scores[category] = score
     
     # 4. Sélection des catégories avec seuil adaptatif
-    # Seuil bas pour permettre multi-catégories
-    min_threshold = 15
-    max_categories = 5  # Maximum de catégories par image
+    min_threshold = 20  # Seuil augmenté pour plus de précision
+    max_categories = 5
     
     # Trier par score
     sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
     
-    print(f"\nScores:")
+    print(f"\nScores finaux:")
     for cat, score in sorted_categories:
         print(f"  {cat}: {score:.1f}")
     
@@ -924,9 +975,8 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             categories_assigned.append(category)
             print(f"  ✓ Assigned to {category} (score: {score:.1f})")
     
-    # 5. Gérer les conflits indoor/outdoor (mutuellement exclusifs en général)
+    # 5. Gérer les conflits indoor/outdoor
     if "indoor" in categories_assigned and "outdoor" in categories_assigned:
-        # Garder celui avec le meilleur score
         if category_scores["indoor"] > category_scores["outdoor"]:
             categories_assigned.remove("outdoor")
             print("  → Removed 'outdoor' (conflict with indoor)")
