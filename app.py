@@ -23,7 +23,31 @@ def load_models():
         processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
         caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
         vqa_model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base").to(device)
-        print("✅ Modèles chargés avec succès !")
+        print("✅ Modèles BLIP chargés avec succès !")
+
+# Chargement de Mistral 7B pour analyse de texte (lazy loading)
+text_classifier = None
+
+def load_text_model():
+    """Charge Mistral 7B Instruct pour analyse de texte"""
+    global text_classifier
+    if text_classifier is None:
+        print("🔄 Chargement de Mistral 7B Instruct...")
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+        
+        # Charger avec quantization pour économiser mémoire
+        text_classifier = {
+            "tokenizer": AutoTokenizer.from_pretrained(model_name),
+            "model": AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                load_in_8bit=True  # Quantization 8-bit pour GPU limité
+            )
+        }
+        print("✅ Mistral 7B chargé avec succès !")
 
 # CSS personnalisé - Style professionnel bleu sobre (police)
 CUSTOM_CSS = """
@@ -1253,6 +1277,126 @@ def page_categorisation_filter(category_id: str, current_state):
     return html
 
 # ============================================================================
+# ANALYSE DE TEXTE avec Mistral 7B
+# ============================================================================
+
+def analyze_text_with_mistral(text_content: str, contexte_enquete: str) -> dict:
+    """
+    Analyse un texte (email, SMS, note) avec Mistral 7B et le classifie
+    Retourne : catégorie (pertinent/a_traiter/non_pertinent), score, explication
+    """
+    load_text_model()
+    
+    # Créer le prompt pour Mistral
+    prompt = f"""<s>[INST] Tu es un assistant d'analyse forensique pour la police. Ton rôle est d'analyser des textes (emails, SMS, notes) dans le cadre d'une enquête et de déterminer leur pertinence.
+
+CONTEXTE DE L'ENQUÊTE:
+{contexte_enquete if contexte_enquete else "Pas de contexte spécifique fourni"}
+
+TEXTE À ANALYSER:
+{text_content}
+
+Analyse ce texte et réponds en JSON avec les champs suivants:
+- "pertinence": un score de 0 à 100 indiquant la pertinence pour l'enquête
+- "categorie": "pertinent" (score ≥55), "a_traiter" (25-54), ou "non_pertinent" (<25)
+- "raisons": liste de 2-3 raisons courtes expliquant le score
+- "elements_cles": liste de mots-clés ou éléments importants détectés
+
+Réponds UNIQUEMENT avec le JSON, sans texte supplémentaire. [/INST]"""
+    
+    try:
+        # Tokenizer et générer
+        tokenizer = text_classifier["tokenizer"]
+        model = text_classifier["model"]
+        
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        
+        # Générer la réponse (limiter la longueur pour économiser ressources)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=300,
+            temperature=0.3,
+            do_sample=True,
+            top_p=0.9
+        )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extraire le JSON de la réponse
+        # La réponse de Mistral contient le prompt + la réponse
+        json_start = response.find("{")
+        json_end = response.rfind("}") + 1
+        
+        if json_start != -1 and json_end > json_start:
+            json_str = response[json_start:json_end]
+            result = json.loads(json_str)
+            
+            return {
+                "score": result.get("pertinence", 50),
+                "category": result.get("categorie", "a_traiter"),
+                "reasons": result.get("raisons", ["Analyse automatique"]),
+                "keywords": result.get("elements_cles", []),
+                "analyzed": True
+            }
+        else:
+            # Si pas de JSON valide, faire une analyse basique
+            return fallback_text_analysis(text_content, contexte_enquete)
+            
+    except Exception as e:
+        print(f"Erreur lors de l'analyse avec Mistral: {e}")
+        return fallback_text_analysis(text_content, contexte_enquete)
+
+def fallback_text_analysis(text_content: str, contexte_enquete: str) -> dict:
+    """
+    Analyse de secours si Mistral échoue
+    Analyse basique par mots-clés
+    """
+    text_lower = text_content.lower()
+    score = 50  # Score de base
+    reasons = []
+    keywords = []
+    
+    # Mots-clés suspects
+    suspect_keywords = ["urgent", "caché", "secret", "argent", "rencontre", "lieu", "arme", "danger"]
+    for word in suspect_keywords:
+        if word in text_lower:
+            score += 10
+            keywords.append(word)
+    
+    # Correspondance avec contexte
+    if contexte_enquete:
+        contexte_words = [w for w in contexte_enquete.lower().split() if len(w) > 4]
+        matches = sum(1 for w in contexte_words if w in text_lower)
+        if matches > 0:
+            score += matches * 8
+            reasons.append(f"{matches} correspondance(s) avec contexte")
+    
+    # Longueur du texte
+    if len(text_content) > 100:
+        reasons.append("Texte détaillé")
+    
+    score = min(100, score)
+    
+    # Classifier
+    if score >= 55:
+        category = "pertinent"
+    elif score >= 25:
+        category = "a_traiter"
+    else:
+        category = "non_pertinent"
+    
+    if not reasons:
+        reasons = ["Analyse automatique basique"]
+    
+    return {
+        "score": score,
+        "category": category,
+        "reasons": reasons,
+        "keywords": keywords,
+        "analyzed": True
+    }
+
+# ============================================================================
 # PAGE 5 : ANALYSE - Espace de travail avec tri pertinence enquête
 # ============================================================================
 
@@ -2341,6 +2485,141 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                 inputs=[enquete_state],
                 outputs=[analyse_display]
             )
+            
+            gr.Markdown("---")
+            gr.Markdown("---")
+            
+            # ====================================================================
+            # SECTION ANALYSE DE TEXTE avec Mistral 7B
+            # ====================================================================
+            
+            gr.HTML('<div class="section-title">📝 Analyse de Texte avec IA</div>')
+            
+            gr.Markdown("""
+            ## Analyser des Textes (Emails, SMS, Notes)
+            
+            Utilisez **Mistral 7B Instruct** pour analyser et classifier des contenus textuels dans le cadre de l'enquête.
+            Le modèle IA analysera le texte et le classera automatiquement en fonction du contexte de votre enquête.
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    text_input = gr.Textbox(
+                        label="📧 Texte à analyser (Email, SMS, Note, etc.)",
+                        placeholder="""Collez ici le texte à analyser:
+- Email suspect
+- SMS échangé
+- Note manuscrite
+- Transcription d'appel
+- Tout autre contenu textuel
+
+Le texte sera analysé par Mistral 7B qui déterminera sa pertinence pour l'enquête.""",
+                        lines=8
+                    )
+                    
+                    analyze_text_btn = gr.Button(
+                        "🤖 Analyser le texte avec Mistral 7B",
+                        variant="primary",
+                        size="lg",
+                        elem_classes=["primary"]
+                    )
+                
+                with gr.Column(scale=1):
+                    text_result = gr.HTML(value="""
+                        <div class="info-message">
+                            ℹ️ Entrez un texte et cliquez sur "Analyser" pour obtenir une classification automatique.
+                        </div>
+                    """)
+            
+            gr.Markdown("""
+            ### 🧠 Fonctionnement de l'Analyse Textuelle
+            
+            Mistral 7B analyse le texte selon plusieurs critères :
+            - **Correspondance avec le contexte** de l'enquête
+            - **Mots-clés suspects** ou importants
+            - **Ton et urgence** du message
+            - **Éléments factuels** (lieux, dates, noms)
+            
+            Le texte est ensuite classé automatiquement :
+            - 🟢 **Pertinent** (≥55/100) : Contenu important pour l'enquête
+            - 🟡 **À traiter** (25-54/100) : Nécessite analyse manuelle
+            - 🔴 **Non pertinent** (<25/100) : Probablement sans intérêt
+            """)
+            
+            # Fonction d'interface pour analyser le texte
+            def analyze_text_interface(text, current_state):
+                if not text or len(text.strip()) < 10:
+                    return """
+                    <div class="info-message">
+                        ⚠️ Veuillez entrer au moins 10 caractères de texte.
+                    </div>
+                    """
+                
+                if current_state is None:
+                    state = EnqueteData()
+                else:
+                    state = current_state
+                
+                contexte = state.enquete_info.get("contexte", "")
+                
+                # Analyser avec Mistral
+                result = analyze_text_with_mistral(text, contexte)
+                
+                # Générer l'affichage
+                category_info = {
+                    "pertinent": {"color": "#28a745", "icon": "🟢", "label": "Pertinent"},
+                    "a_traiter": {"color": "#ffc107", "icon": "🟡", "label": "À traiter"},
+                    "non_pertinent": {"color": "#dc3545", "icon": "🔴", "label": "Non pertinent"}
+                }
+                
+                cat = category_info.get(result["category"], category_info["a_traiter"])
+                
+                reasons_html = "<br>".join([f"• {r}" for r in result["reasons"]])
+                keywords_html = " ".join([f'<span style="background: var(--secondary-blue); color: white; padding: 4px 10px; border-radius: 12px; margin: 2px; display: inline-block;">{k}</span>' for k in result["keywords"]]) if result["keywords"] else "Aucun"
+                
+                html = f"""
+                <div style="font-family: 'Segoe UI', Arial, sans-serif;">
+                    <div style="background: {cat['color']}20; border-left: 5px solid {cat['color']}; padding: 20px; border-radius: 8px;">
+                        <h2 style="margin: 0; color: {cat['color']};">
+                            {cat['icon']} {cat['label']}
+                        </h2>
+                        <div style="margin-top: 15px;">
+                            <div style="background: {cat['color']}; color: white; padding: 10px 20px; border-radius: 20px; display: inline-block; font-weight: 700; font-size: 1.3em;">
+                                Score: {result['score']}/100
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="background: white; border: 2px solid var(--border-gray); border-radius: 10px; padding: 20px; margin-top: 20px;">
+                        <h4 style="color: var(--primary-blue); margin-top: 0;">💡 Raisons de la Classification</h4>
+                        <p style="line-height: 1.8; color: #555;">
+                            {reasons_html}
+                        </p>
+                    </div>
+                    
+                    <div style="background: white; border: 2px solid var(--border-gray); border-radius: 10px; padding: 20px; margin-top: 15px;">
+                        <h4 style="color: var(--primary-blue); margin-top: 0;">🏷️ Mots-Clés Détectés</h4>
+                        <div style="margin-top: 10px;">
+                            {keywords_html}
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 15px; padding: 15px; background: #e9ecef; border-radius: 8px;">
+                        <div style="background: #fff; border-radius: 10px; overflow: hidden; height: 12px;">
+                            <div style="background: {cat['color']}; height: 100%; width: {result['score']}%; transition: width 0.5s;"></div>
+                        </div>
+                    </div>
+                </div>
+                """
+                
+                return html
+            
+            # Événement analyse texte
+            analyze_text_btn.click(
+                fn=analyze_text_interface,
+                inputs=[text_input, enquete_state],
+                outputs=[text_result]
+            )
     
     # Pied de page
     gr.Markdown("""
@@ -2353,9 +2632,11 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
     - Pour un usage en production, déployez cette application en local
     
     ### 🧠 Technologies
-    - **Intelligence Artificielle** : BLIP (Captioning + VQA)
-    - **Interface** : Gradio
-    - **Version** : 2.0 - Multi-pages
+    - **Intelligence Artificielle** : 
+      - BLIP (Captioning + VQA) pour images
+      - Mistral 7B Instruct pour textes
+    - **Interface** : Gradio Multi-pages
+    - **Version** : 3.0 - Images + Textes
     """)
 
 # Lancement de l'application
