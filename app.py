@@ -497,71 +497,96 @@ def page_recherche_search(query: str, current_state):
     
     query_lower = query.lower().strip()
     
-    # Dictionnaire ÉTENDU de synonymes et variations (EN et FR) avec pluriels
-    # Chaque groupe contient toutes les variations possibles
-    synonym_groups = [
-        # Personnes
-        ["person", "people", "man", "men", "woman", "women", "human", "humans", "individual", "individuals",
-         "personne", "personnes", "homme", "hommes", "femme", "femmes", "gens", "individu", "individus",
-         "boy", "boys", "girl", "girls", "child", "children", "kid", "kids",
-         "garcon", "garçon", "fille", "filles", "enfant", "enfants"],
+    # Dictionnaire COMPLET de traduction FR→EN et variations
+    # Organisation par CONCEPT pour recherche sémantique large
+    fr_to_en_concepts = {
+        # PERSONNES (toutes variations)
+        "personne": ["person", "people", "man", "men", "woman", "women", "human", "humans", "individual", "individuals", "boy", "boys", "girl", "girls", "child", "children", "kid", "kids", "face", "faces"],
+        "homme": ["man", "men", "male", "guy", "person", "people", "human"],
+        "femme": ["woman", "women", "female", "lady", "person", "people", "human"],
+        "gens": ["people", "persons", "humans", "crowd", "group"],
+        "enfant": ["child", "children", "kid", "kids", "boy", "boys", "girl", "girls"],
+        "garçon": ["boy", "boys", "child", "kid"],
+        "fille": ["girl", "girls", "child", "kid"],
         
-        # Véhicules
-        ["car", "cars", "vehicle", "vehicles", "automobile", "automobiles", "auto", "autos",
-         "voiture", "voitures", "véhicule", "véhicules", "auto",
-         "truck", "trucks", "camion", "camions", "bus", "motorcycle", "motorcycles", "moto", "motos",
-         "bike", "bikes", "vélo", "vélos"],
+        # VÉHICULES (tous types)
+        "voiture": ["car", "cars", "vehicle", "vehicles", "automobile", "auto"],
+        "véhicule": ["vehicle", "vehicles", "car", "cars", "truck", "trucks", "automobile", "transportation"],
+        "auto": ["car", "cars", "automobile", "vehicle"],
+        "camion": ["truck", "trucks", "van", "vehicle"],
+        "moto": ["motorcycle", "motorcycles", "bike", "motorbike"],
+        "vélo": ["bike", "bikes", "bicycle", "bicycles", "cycling"],
         
-        # Bâtiments
-        ["building", "buildings", "house", "houses", "structure", "structures", "place", "places",
-         "bâtiment", "bâtiments", "batiment", "batiments", "maison", "maisons", "immeuble", "immeubles",
-         "lieu", "lieux", "location", "locations"],
+        # ARMES (tous types)
+        "arme": ["weapon", "weapons", "gun", "guns", "knife", "knives", "rifle", "blade", "firearm"],
+        "couteau": ["knife", "knives", "blade", "blades", "cutting", "sharp"],
+        "pistolet": ["pistol", "gun", "handgun", "firearm"],
+        "fusil": ["rifle", "gun", "firearm", "weapon"],
         
-        # Documents
-        ["document", "documents", "paper", "papers", "text", "texts", "writing", "sign", "signs",
-         "papier", "papiers", "texte", "textes", "écrit", "écrits", "ecrit", "ecrits",
-         "letter", "letters", "lettre", "lettres", "note", "notes"],
+        # BÂTIMENTS & LIEUX
+        "bâtiment": ["building", "buildings", "structure", "structures", "architecture"],
+        "batiment": ["building", "buildings", "structure", "structures"],
+        "maison": ["house", "houses", "home", "building"],
+        "immeuble": ["building", "buildings", "apartment", "structure"],
+        "lieu": ["place", "places", "location", "locations", "site"],
         
-        # Armes
-        ["weapon", "weapons", "gun", "guns", "knife", "knives", "rifle", "rifles",
-         "arme", "armes", "pistolet", "pistolets", "couteau", "couteaux", "fusil", "fusils"],
+        # DOCUMENTS & TEXTES
+        "document": ["document", "documents", "paper", "papers", "file"],
+        "papier": ["paper", "papers", "document", "sheet"],
+        "texte": ["text", "texts", "writing", "written"],
+        "écrit": ["writing", "written", "text", "script"],
+        "lettre": ["letter", "letters", "writing"],
+        "signe": ["sign", "signs", "signage"],
         
-        # Extérieur
-        ["outdoor", "outdoors", "outside", "street", "streets", "road", "roads",
-         "extérieur", "exterieur", "dehors", "rue", "rues", "route", "routes",
-         "park", "parks", "parc", "parcs"],
+        # ANIMAUX (CATÉGORIE LARGE - FIX PRINCIPAL)
+        "animal": ["dog", "dogs", "cat", "cats", "animal", "animals", "pet", "pets", "bird", "birds", "horse", "horses", "wildlife"],
+        "animaux": ["dog", "dogs", "cat", "cats", "animal", "animals", "pet", "pets", "bird", "birds", "horse", "horses"],
+        "chien": ["dog", "dogs", "puppy", "canine"],
+        "chat": ["cat", "cats", "kitten", "feline"],
+        "oiseau": ["bird", "birds", "flying"],
         
-        # Intérieur
-        ["indoor", "indoors", "inside", "room", "rooms", "interior", "interiors",
-         "intérieur", "interieur", "dedans", "pièce", "piece", "pièces", "pieces",
-         "salle", "salles", "chambre", "chambres"],
+        # ENVIRONNEMENT
+        "extérieur": ["outdoor", "outdoors", "outside", "exterior", "external"],
+        "exterieur": ["outdoor", "outdoors", "outside", "exterior"],
+        "dehors": ["outside", "outdoor", "outdoors", "exterior"],
+        "rue": ["street", "streets", "road", "roads"],
+        "route": ["road", "roads", "street", "highway"],
+        "parc": ["park", "parks", "garden"],
         
-        # Objets
-        ["object", "objects", "item", "items", "thing", "things",
-         "objet", "objets", "chose", "choses", "element", "éléments", "elements"]
-    ]
+        "intérieur": ["indoor", "indoors", "inside", "interior", "internal"],
+        "interieur": ["indoor", "indoors", "inside", "interior"],
+        "dedans": ["inside", "indoor", "indoors", "interior"],
+        "pièce": ["room", "rooms", "space"],
+        "piece": ["room", "rooms", "space"],
+        "salle": ["room", "rooms", "hall"],
+        "chambre": ["room", "bedroom", "chamber"],
+        
+        # OBJETS
+        "objet": ["object", "objects", "item", "items", "thing", "things"],
+        "chose": ["thing", "things", "object", "item"],
+        "outil": ["tool", "tools", "implement", "equipment"]
+    }
     
-    # Construire la liste de tous les termes de recherche
+    # Construire la liste ÉTENDUE de termes de recherche
     search_terms = [query_lower]
     
-    # Trouver le groupe de synonymes correspondant
-    for group in synonym_groups:
-        if query_lower in group:
-            search_terms.extend(group)
-            break
+    # Vérifier si le mot recherché est une clé FR du dictionnaire
+    if query_lower in fr_to_en_concepts:
+        # Ajouter TOUTES les traductions EN
+        search_terms.extend(fr_to_en_concepts[query_lower])
+        print(f"Mot FR '{query_lower}' traduit vers: {fr_to_en_concepts[query_lower][:5]}...")
+    
+    # Vérifier aussi les variations (avec/sans accents)
+    # Ex: "batiment" → "bâtiment" → traductions
+    for fr_word, en_translations in fr_to_en_concepts.items():
+        if query_lower in fr_word or fr_word in query_lower:
+            search_terms.extend(en_translations)
     
     # Enlever les doublons
     search_terms = list(set(search_terms))
     
     # Extraire les mots individuels de la requête (pour recherche multi-mots)
     query_words = [w for w in query_lower.split() if len(w) > 2]
-    
-    # Ajouter aussi les préfixes de 3+ caractères pour recherche encore plus flexible
-    prefixes = []
-    if len(query_lower) >= 3:
-        prefixes.append(query_lower[:3])
-    if len(query_lower) >= 4:
-        prefixes.append(query_lower[:4])
     
     print(f"\n=== Recherche: '{query}' ===")
     print(f"Search terms (avec synonymes): {search_terms[:10]}")
@@ -2006,8 +2031,8 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             with gr.Row():
                 with gr.Column(scale=4):
                     search_query = gr.Textbox(
-                        label="Entrez votre recherche",
-                        placeholder="Ex: person, car, document, building, outdoor...",
+                        label="Entrez votre recherche (en français)",
+                        placeholder="Ex: personne, voiture, document, animal, bâtiment, arme...",
                         lines=1,
                         elem_id="search_box"
                     )
