@@ -792,6 +792,13 @@ CATEGORIES_POLICE = {
         "description": "Objets, preuves matérielles, équipements",
         "color": "#DFE6E9"
     },
+    "animals": {
+        "icon": "🐾",
+        "label": "Animals",
+        "label_fr": "Animaux",
+        "description": "Animaux domestiques ou sauvages (chiens, chats, etc.)",
+        "color": "#FFA07A"
+    },
     "unclassified": {
         "icon": "❓",
         "label": "Unclassified",
@@ -848,14 +855,14 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             "weight": 1.0
         },
         "weapons": {
-            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "dangerous", "cutting", "sharp"],
+            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm"],
             "vqa_questions": [
                 "Is there a knife, blade, or sharp cutting tool visible in this image?",
-                "Can you see a gun, firearm, rifle, or pistol?",
-                "What tool or object is the person holding or using?",
-                "Are there any sharp objects, blades, or potentially dangerous items?"
+                "Can you see a gun, firearm, rifle, or pistol?"
             ],
-            "weight": 1.3  # Poids élevé pour sécurité
+            "weight": 1.2,  # Poids réduit légèrement
+            # Liste d'exclusion pour éviter faux positifs
+            "exclude_keywords": ["dog", "cat", "animal", "pet", "food", "fruit", "vegetable", "phone", "bottle"]
         },
         "documents": {
             "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
@@ -898,6 +905,14 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                 "What objects or items can you see in this picture?"
             ],
             "weight": 0.7
+        },
+        "animals": {
+            "keywords": ["dog", "cat", "animal", "pet", "bird", "horse"],
+            "vqa_questions": [
+                "Is there a dog, cat, or any animal in this image?",
+                "Can you see a pet or animal?"
+            ],
+            "weight": 0.6  # Poids faible, généralement pas prioritaire pour enquêtes
         }
     }
     
@@ -916,6 +931,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         # B. Poser TOUTES les questions VQA pour cette catégorie
         positive_answers = 0
         total_questions = len(config["vqa_questions"])
+        has_exclusion = False
         
         for i, question in enumerate(config["vqa_questions"]):
             vqa_answer = ask_vqa_question(image, question)
@@ -923,6 +939,14 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             
             if vqa_answer:
                 vqa_lower = vqa_answer.lower()
+                
+                # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
+                exclude_list = config.get("exclude_keywords", [])
+                if exclude_list and any(excluded in vqa_lower for excluded in exclude_list):
+                    print(f"  → Q{i+1} Excluded (faux positif détecté: {[e for e in exclude_list if e in vqa_lower]})")
+                    has_exclusion = True
+                    score -= 15  # Pénalité forte
+                    continue
                 
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
@@ -950,6 +974,11 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                         score += 15 * config["weight"]
                         print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
         
+        # Si exclusion détectée, annuler le score pour cette catégorie
+        if has_exclusion and category == "weapons":
+            score = max(0, score - 30)  # Pénalité supplémentaire pour weapons
+            print(f"  → EXCLUSION penalty applied, score reduced")
+        
         # Bonus si plusieurs questions confirment la catégorie
         if positive_answers >= 2:
             bonus = 20 * config["weight"]
@@ -959,7 +988,19 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         category_scores[category] = score
     
     # 4. Sélection des catégories avec seuil adaptatif
-    min_threshold = 20  # Seuil augmenté pour plus de précision
+    # Seuils différents selon la catégorie pour éviter faux positifs
+    category_thresholds = {
+        "weapons": 35,      # Seuil PLUS ÉLEVÉ pour weapons (éviter faux positifs)
+        "people": 20,
+        "vehicles": 20,
+        "documents": 20,
+        "buildings": 20,
+        "outdoor": 15,
+        "indoor": 15,
+        "objects": 25,      # Seuil plus élevé car très générique
+        "animals": 18       # Seuil normal pour animaux
+    }
+    
     max_categories = 5
     
     # Trier par score
@@ -967,13 +1008,15 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     
     print(f"\nScores finaux:")
     for cat, score in sorted_categories:
-        print(f"  {cat}: {score:.1f}")
+        threshold = category_thresholds.get(cat, 20)
+        print(f"  {cat}: {score:.1f} (seuil: {threshold})")
     
-    # Assigner les catégories au-dessus du seuil
+    # Assigner les catégories au-dessus de leur seuil spécifique
     for category, score in sorted_categories:
-        if score >= min_threshold and len(categories_assigned) < max_categories:
+        threshold = category_thresholds.get(category, 20)
+        if score >= threshold and len(categories_assigned) < max_categories:
             categories_assigned.append(category)
-            print(f"  ✓ Assigned to {category} (score: {score:.1f})")
+            print(f"  ✓ Assigned to {category} (score: {score:.1f}, threshold: {threshold})")
     
     # 5. Gérer les conflits indoor/outdoor
     if "indoor" in categories_assigned and "outdoor" in categories_assigned:
@@ -1991,14 +2034,15 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             Cette page classe automatiquement vos images dans des catégories pertinentes pour l'enquête :
             - **👤 Personnes** : Suspects, témoins, visages
             - **🚗 Véhicules** : Voitures, motos, plaques
-            - **⚠️ Armes/Suspects** : Armes, objets dangereux
+            - **⚠️ Armes/Suspects** : Armes, objets dangereux (seuil strict)
             - **📄 Documents/Textes** : Papiers, textes, preuves écrites
             - **🏢 Bâtiments/Lieux** : Bâtiments, scènes de crime
             - **🌳 Extérieur** : Scènes extérieures, rues, nature
             - **🏠 Intérieur** : Scènes intérieures, pièces
             - **📦 Objets** : Preuves matérielles, équipements
+            - **🐾 Animaux** : Chiens, chats, animaux domestiques
             
-            Les images sont analysées par l'IA BLIP et peuvent appartenir à plusieurs catégories.
+            Les images sont analysées par l'IA BLIP avec plusieurs questions par catégorie pour plus de précision.
             """)
             
             # Bouton pour lancer la catégorisation
