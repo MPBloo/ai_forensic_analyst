@@ -6,6 +6,8 @@ from typing import List, Dict, Tuple, Optional
 import pandas as pd
 from datetime import datetime
 import json
+import base64
+from io import BytesIO
 
 # Configuration du device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -458,6 +460,30 @@ def generate_stats_html(state: EnqueteData) -> str:
     return html
 
 # ============================================================================
+# UTILITAIRES - Conversion images
+# ============================================================================
+
+def pil_to_base64(image: Image.Image, max_size=(400, 400)) -> str:
+    """
+    Convertit une image PIL en base64 pour affichage HTML
+    Redimensionne l'image pour optimiser les performances
+    """
+    try:
+        # Redimensionner l'image pour l'aperçu (économiser bande passante)
+        img_copy = image.copy()
+        img_copy.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        # Convertir en base64
+        buffered = BytesIO()
+        img_copy.save(buffered, format="JPEG", quality=85)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        return f"data:image/jpeg;base64,{img_str}"
+    except Exception as e:
+        print(f"Erreur conversion image: {e}")
+        return ""
+
+# ============================================================================
 # PAGE 2 : RECHERCHE - Recherche textuelle dans les images
 # ============================================================================
 
@@ -733,6 +759,11 @@ def page_recherche_search(query: str, current_state):
             score_color = "#dc3545"
             score_label = "Faible pertinence"
         
+        # Convertir l'image en base64 pour affichage
+        image_base64 = ""
+        if "image" in analysis and analysis["image"] is not None:
+            image_base64 = pil_to_base64(analysis["image"], max_size=(350, 350))
+        
         html += f"""
         <div style="background: white; border: 2px solid {score_color}; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 15px;">
@@ -749,7 +780,45 @@ def page_recherche_search(query: str, current_state):
                     <p style="margin: 5px 0 0 0; font-size: 0.85em; color: #666;">{score_label}</p>
                 </div>
             </div>
+        """
+        
+        # Afficher l'image si disponible
+        if image_base64:
+            html += f"""
+            <div style="display: flex; gap: 20px; margin: 15px 0;">
+                <div style="flex: 0 0 350px;">
+                    <img src="{image_base64}" style="width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);" alt="{analysis['filename']}">
+                </div>
+                <div style="flex: 1;">
+                    <div style="background: var(--light-blue); padding: 15px; border-radius: 6px;">
+                        <p style="margin: 0 0 5px 0; font-weight: 600; color: var(--primary-blue);">📝 Description :</p>
+                        <p style="margin: 0; line-height: 1.6;">{analysis['description']}</p>
+                    </div>
+                    
+                    <div style="margin-top: 15px;">
+                        <p style="margin: 0 0 8px 0; font-weight: 600; color: var(--primary-blue);">🏷️ Tags :</p>
+                        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            """
             
+            for tag in analysis['tags']:
+                html += f"""
+                            <span style="background: var(--secondary-blue); color: white; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; font-weight: 500;">
+                                {tag}
+                            </span>
+                """
+            
+            if not analysis['tags']:
+                html += '<span style="color: #999; font-style: italic;">Aucun tag</span>'
+            
+            html += """
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
+        else:
+            # Si pas d'image, affichage classique
+            html += f"""
             <div style="background: var(--light-blue); padding: 15px; border-radius: 6px; margin: 15px 0;">
                 <p style="margin: 0 0 5px 0; font-weight: 600; color: var(--primary-blue);">📝 Description :</p>
                 <p style="margin: 0; line-height: 1.6;">{analysis['description']}</p>
@@ -759,20 +828,23 @@ def page_recherche_search(query: str, current_state):
                 <p style="margin: 0 0 8px 0; font-weight: 600; color: var(--primary-blue);">🏷️ Tags :</p>
                 <div style="display: flex; flex-wrap: wrap; gap: 8px;">
         """
-        
-        for tag in analysis['tags']:
-            html += f"""
-                    <span style="background: var(--secondary-blue); color: white; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; font-weight: 500;">
-                        {tag}
-                    </span>
+            
+            for tag in analysis['tags']:
+                html += f"""
+                        <span style="background: var(--secondary-blue); color: white; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; font-weight: 500;">
+                            {tag}
+                        </span>
+                """
+            
+            if not analysis['tags']:
+                html += '<span style="color: #999; font-style: italic;">Aucun tag</span>'
+            
+            html += """
+                    </div>
+                </div>
             """
         
-        if not analysis['tags']:
-            html += '<span style="color: #999; font-style: italic;">Aucun tag</span>'
-        
         html += """
-                </div>
-            </div>
         </div>
         """
     
