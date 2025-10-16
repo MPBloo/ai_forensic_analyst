@@ -326,6 +326,46 @@ textarea {
     left: -9999px !important;
 }
 
+/* Messages temporaires */
+.temporary-message {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+    color: white;
+    padding: 15px 25px;
+    border-radius: 10px;
+    box-shadow: 0 4px 20px rgba(40, 167, 69, 0.3);
+    z-index: 1000;
+    font-weight: 600;
+    font-size: 1.1em;
+    animation: slideInRight 0.5s ease-out, fadeOut 0.5s ease-in 4.5s forwards;
+    max-width: 400px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+}
+
+@keyframes slideInRight {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes fadeOut {
+    from {
+        opacity: 1;
+        transform: translateX(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateX(100%);
+    }
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     .main-header {
@@ -358,6 +398,15 @@ textarea {
     
     .gradio-tabs .tab-nav button span {
         font-size: 1.2em;
+    }
+    
+    /* Messages temporaires responsive */
+    .temporary-message {
+        top: 10px;
+        right: 10px;
+        padding: 12px 20px;
+        font-size: 1em;
+        max-width: 300px;
     }
     
     .section-card {
@@ -540,11 +589,20 @@ def page_accueil_init_images(files, current_state):
     
     # Message de confirmation
     message = f"""
-    <div class="success-message">
+    <div class="temporary-message" id="upload-success-{len(state.images)}">
         ✅ <strong>{len(new_images)} image(s)</strong> uploadée(s) avec succès
         <br>
         📊 Total dans l'enquête : <strong>{len(state.images)} image(s)</strong>
     </div>
+    <script>
+        // Supprimer le message après 5 secondes
+        setTimeout(function() {{
+            const msg = document.getElementById('upload-success-{len(state.images)}');
+            if (msg) {{
+                msg.style.display = 'none';
+            }}
+        }}, 5000);
+    </script>
     """
     
     # Statistiques
@@ -565,9 +623,18 @@ def page_accueil_save_context(titre, contexte, current_state):
     state.enquete_info["contexte"] = contexte
     
     message = """
-    <div class="success-message">
+    <div class="temporary-message" id="info-saved-success">
         ✅ Informations de l'enquête enregistrées avec succès
     </div>
+    <script>
+        // Supprimer le message après 5 secondes
+        setTimeout(function() {
+            const msg = document.getElementById('info-saved-success');
+            if (msg) {
+                msg.style.display = 'none';
+            }
+        }, 5000);
+    </script>
     """
     
     return message, state
