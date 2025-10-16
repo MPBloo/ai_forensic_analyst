@@ -1181,7 +1181,7 @@ def page_categorisation_analyze(current_state):
         <div class="info-message">
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
-        """, current_state, "", {}
+        """, current_state, "", {}, gr.Group(visible=True), gr.Group(visible=False)
     
     # S'assurer que les images sont analysées (descriptions, tags)
     if len(current_state.analyses) < len(current_state.images):
@@ -1211,21 +1211,19 @@ def page_categorisation_analyze(current_state):
     </div>
     """
     
-    # Générer le HTML de la sidebar
-    sidebar_html = generate_categories_sidebar(categories_count)
+    # Générer le HTML des statistiques cliquables
+    stats_html = generate_clickable_categories_stats(categories_count)
     
-    return status_msg, current_state, sidebar_html, categories_count
+    # Retourner avec changement d'état : masquer boutons, afficher stats
+    return status_msg, current_state, stats_html, categories_count, gr.Group(visible=False), gr.Group(visible=True)
 
-def generate_categories_sidebar(categories_count: dict) -> str:
+def generate_clickable_categories_stats(categories_count: dict) -> str:
     """
-    Génère le HTML des statistiques de catégorisation
-    (Les boutons cliquables sont maintenant des boutons Gradio, pas dans le HTML)
+    Génère le HTML des statistiques cliquables pour filtrer les images
+    (Remplace les boutons Gradio par des éléments HTML cliquables)
     """
     html = """
     <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px; border: 2px solid var(--border-gray);">
-        <h4 style="color: var(--primary-blue); margin-top: 0; border-bottom: 2px solid var(--accent-blue); padding-bottom: 10px;">
-            📊 Statistiques de Catégorisation
-        </h4>
     """
     
     total_images = sum(categories_count.values())
@@ -1238,32 +1236,64 @@ def generate_categories_sidebar(categories_count: dict) -> str:
             percentage = (count / total_images * 100) if total_images > 0 else 0
             
             html += f"""
-            <div style="margin: 12px 0; padding: 10px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+            <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
+                 onclick="filterByCategory('{cat_id}')"
+                 onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
+                 onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                     <div>
-                        <span style="font-size: 1.3em; margin-right: 6px;">{cat_info['icon']}</span>
-                        <strong style="color: var(--dark-text); font-size: 0.95em;">{label_display}</strong>
+                        <span style="font-size: 1.4em; margin-right: 8px;">{cat_info['icon']}</span>
+                        <strong style="color: var(--dark-text); font-size: 1em;">{label_display}</strong>
                     </div>
-                    <span style="background: {cat_info['color']}; color: white; padding: 3px 10px; border-radius: 12px; font-weight: 700; font-size: 0.9em;">
+                    <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
                         {count}
                     </span>
                 </div>
-                <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 6px; margin-top: 8px;">
+                <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 8px; margin-top: 8px;">
                     <div style="background: {cat_info['color']}; height: 100%; width: {percentage:.1f}%; transition: width 0.5s;"></div>
                 </div>
-                <p style="margin: 5px 0 0 0; font-size: 0.75em; color: #888; text-align: right;">
-                    {percentage:.1f}% des images
+                <p style="margin: 6px 0 0 0; font-size: 0.8em; color: #888; text-align: right;">
+                    {percentage:.1f}% des images • Cliquez pour filtrer
                 </p>
             </div>
             """
     
+    # Bouton "Toutes les images"
     html += f"""
-        <div style="margin-top: 20px; padding: 15px; background: var(--light-blue); border-radius: 8px; text-align: center;">
+        <div style="margin: 15px 0; padding: 15px; background: var(--light-blue); border-radius: 8px; cursor: pointer; text-align: center; transition: all 0.3s ease;" 
+             onclick="filterByCategory('all')"
+             onmouseover="this.style.background='var(--accent-blue)'; this.style.color='white'" 
+             onmouseout="this.style.background='var(--light-blue)'; this.style.color='var(--primary-blue)'">
             <p style="margin: 0; font-weight: 600; color: var(--primary-blue); font-size: 1.1em;">
+                📋 Toutes les images ({total_images})
+            </p>
+        </div>
+    """
+    
+    html += f"""
+        <div style="margin-top: 20px; padding: 12px; background: #f8f9fa; border-radius: 8px; text-align: center; border: 1px solid #dee2e6;">
+            <p style="margin: 0; font-weight: 500; color: #6c757d; font-size: 0.9em;">
                 Total : {total_images} image(s) catégorisée(s)
             </p>
         </div>
     </div>
+    
+    <script>
+    function filterByCategory(categoryId) {{
+        console.log('Filtering by category:', categoryId);
+        
+        // Déclencher le bouton Gradio caché correspondant
+        const buttonId = categoryId === 'all' ? 'hidden_show_all' : 'hidden_cat_' + categoryId;
+        const hiddenButton = document.getElementById(buttonId);
+        
+        if (hiddenButton) {{
+            // Simuler un clic sur le bouton caché
+            hiddenButton.click();
+        }} else {{
+            console.error('Hidden button not found:', buttonId);
+        }}
+    }}
+    </script>
     """
     
     return html
@@ -2336,34 +2366,58 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             
             # Layout avec sidebar et zone d'affichage
             with gr.Row():
-                # Sidebar gauche - Liste des catégories CLIQUABLES
+                # Sidebar gauche - Deux états : boutons OU statistiques cliquables
                 with gr.Column(scale=1):
                     gr.HTML('<h3 style="color: var(--primary-blue); margin-top: 0;">📂 Catégories</h3>')
                     
-                    gr.Markdown("""
-                    Cliquez sur une catégorie ci-dessous pour afficher les images correspondantes.
-                    """)
-                    
-                    # Boutons pour chaque catégorie (design amélioré, pas de doublon)
-                    cat_buttons = {}
-                    for cat_id, cat_info in CATEGORIES_POLICE.items():
-                        label_display = cat_info.get('label_fr', cat_info['label'])
-                        cat_buttons[cat_id] = gr.Button(
-                            f"{cat_info['icon']} {label_display}",
-                            variant="secondary",
-                            size="sm",
-                            elem_id=f"cat_btn_{cat_id}"
+                    # ÉTAT 1: Boutons catégories (visibles avant catégorisation)
+                    with gr.Group(visible=True) as cat_buttons_group:
+                        gr.Markdown("""
+                        Cliquez sur une catégorie ci-dessous pour afficher les images correspondantes.
+                        """)
+                        
+                        # Boutons pour chaque catégorie
+                        cat_buttons = {}
+                        for cat_id, cat_info in CATEGORIES_POLICE.items():
+                            label_display = cat_info.get('label_fr', cat_info['label'])
+                            cat_buttons[cat_id] = gr.Button(
+                                f"{cat_info['icon']} {label_display}",
+                                variant="secondary",
+                                size="sm",
+                                elem_id=f"cat_btn_{cat_id}"
+                            )
+                        
+                        # Bouton pour afficher toutes les images
+                        show_all_btn = gr.Button(
+                            "📋 Toutes les images",
+                            variant="primary",
+                            size="sm"
                         )
                     
-                    # Bouton pour afficher toutes les images
-                    show_all_btn = gr.Button(
-                        "📋 Toutes les images",
-                        variant="primary",
-                        size="sm"
-                    )
-                    
-                    # Statistiques (s'affiche après catégorisation)
-                    categories_stats = gr.HTML(value="")
+                    # ÉTAT 2: Statistiques cliquables (visibles après catégorisation)
+                    with gr.Group(visible=False) as stats_group:
+                        gr.Markdown("""
+                        **📊 Statistiques de Catégorisation**  
+                        Cliquez sur une catégorie ci-dessous pour filtrer les images.
+                        """)
+                        
+                        # Statistiques cliquables (sera généré dynamiquement)
+                        categories_stats = gr.HTML(value="")
+                        
+                        # Boutons cachés pour déclencher les événements Gradio
+                        hidden_cat_buttons = {}
+                        for cat_id, cat_info in CATEGORIES_POLICE.items():
+                            hidden_cat_buttons[cat_id] = gr.Button(
+                                f"Hidden_{cat_id}",
+                                visible=False,
+                                elem_id=f"hidden_cat_{cat_id}"
+                            )
+                        
+                        hidden_show_all_btn = gr.Button(
+                            "Hidden_All",
+                            visible=False,
+                            elem_id="hidden_show_all"
+                        )
                 
                 # Zone principale droite - Affichage des images filtrées
                 with gr.Column(scale=3):
@@ -2377,10 +2431,10 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             categorize_btn.click(
                 fn=page_categorisation_analyze,
                 inputs=[enquete_state],
-                outputs=[categorize_status, enquete_state, categories_stats, gr.State()]
+                outputs=[categorize_status, enquete_state, categories_stats, gr.State(), cat_buttons_group, stats_group]
             )
             
-            # Événements pour chaque bouton de catégorie
+            # Événements pour chaque bouton de catégorie (état 1)
             for cat_id, btn in cat_buttons.items():
                 btn.click(
                     fn=lambda state, cid=cat_id: page_categorisation_filter(cid, state),
@@ -2388,8 +2442,23 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                     outputs=[images_display]
                 )
             
-            # Afficher toutes les images
+            # Afficher toutes les images (état 1)
             show_all_btn.click(
+                fn=lambda state: page_categorisation_filter("all", state),
+                inputs=[enquete_state],
+                outputs=[images_display]
+            )
+            
+            # Événements pour les boutons cachés (état 2 - statistiques cliquables)
+            for cat_id, btn in hidden_cat_buttons.items():
+                btn.click(
+                    fn=lambda state, cid=cat_id: page_categorisation_filter(cid, state),
+                    inputs=[enquete_state],
+                    outputs=[images_display]
+                )
+            
+            # Bouton caché "Toutes les images"
+            hidden_show_all_btn.click(
                 fn=lambda state: page_categorisation_filter("all", state),
                 inputs=[enquete_state],
                 outputs=[images_display]
