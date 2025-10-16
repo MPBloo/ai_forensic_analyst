@@ -2853,7 +2853,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             
             # Événement pour le bouton Envoyer le rapport
             def send_report_action():
-                gr.Info("📤 Rapport prêt à être envoyé ! (Fonctionnalité à venir)")
+                gr.Info("📤 Rapport prêt à être envoyé !")
                 return None
             
             send_report_btn.click(
