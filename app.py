@@ -1217,38 +1217,55 @@ def page_categorisation_analyze(current_state):
     return status_msg, current_state, sidebar_html, categories_count
 
 def generate_categories_sidebar(categories_count: dict) -> str:
-    """Génère le HTML de la sidebar avec les catégories"""
-    html = """
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px;">
-        <h3 style="color: var(--primary-blue); margin-top: 0; border-bottom: 2px solid var(--accent-blue); padding-bottom: 10px;">
-            📂 Catégories
-        </h3>
     """
+    Génère le HTML des statistiques de catégorisation
+    (Les boutons cliquables sont maintenant des boutons Gradio, pas dans le HTML)
+    """
+    html = """
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px; border: 2px solid var(--border-gray);">
+        <h4 style="color: var(--primary-blue); margin-top: 0; border-bottom: 2px solid var(--accent-blue); padding-bottom: 10px;">
+            📊 Statistiques de Catégorisation
+        </h4>
+    """
+    
+    total_images = sum(categories_count.values())
     
     for cat_id, cat_info in CATEGORIES_POLICE.items():
         count = categories_count.get(cat_id, 0)
-        label_display = cat_info.get('label_fr', cat_info['label'])  # Utiliser label_fr si disponible
+        label_display = cat_info.get('label_fr', cat_info['label'])
         
-        html += f"""
-        <div style="margin: 10px 0; padding: 12px; background: {cat_info['color']}20; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s;" 
-             onmouseover="this.style.background='{cat_info['color']}40'" 
-             onmouseout="this.style.background='{cat_info['color']}20'">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <span style="font-size: 1.5em; margin-right: 8px;">{cat_info['icon']}</span>
-                    <strong style="color: var(--dark-text);">{label_display}</strong>
+        if count > 0:  # Afficher seulement les catégories avec des images
+            percentage = (count / total_images * 100) if total_images > 0 else 0
+            
+            html += f"""
+            <div style="margin: 12px 0; padding: 10px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                    <div>
+                        <span style="font-size: 1.3em; margin-right: 6px;">{cat_info['icon']}</span>
+                        <strong style="color: var(--dark-text); font-size: 0.95em;">{label_display}</strong>
+                    </div>
+                    <span style="background: {cat_info['color']}; color: white; padding: 3px 10px; border-radius: 12px; font-weight: 700; font-size: 0.9em;">
+                        {count}
+                    </span>
                 </div>
-                <span style="background: {cat_info['color']}; color: white; padding: 4px 10px; border-radius: 12px; font-weight: 600; font-size: 0.9em;">
-                    {count}
-                </span>
+                <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 6px; margin-top: 8px;">
+                    <div style="background: {cat_info['color']}; height: 100%; width: {percentage:.1f}%; transition: width 0.5s;"></div>
+                </div>
+                <p style="margin: 5px 0 0 0; font-size: 0.75em; color: #888; text-align: right;">
+                    {percentage:.1f}% des images
+                </p>
             </div>
-            <p style="margin: 5px 0 0 0; font-size: 0.85em; color: #666; padding-left: 32px;">
-                {cat_info['description']}
+            """
+    
+    html += f"""
+        <div style="margin-top: 20px; padding: 15px; background: var(--light-blue); border-radius: 8px; text-align: center;">
+            <p style="margin: 0; font-weight: 600; color: var(--primary-blue); font-size: 1.1em;">
+                Total : {total_images} image(s) catégorisée(s)
             </p>
         </div>
-        """
+    </div>
+    """
     
-    html += "</div>"
     return html
 
 def page_categorisation_filter(category_id: str, current_state):
@@ -2319,13 +2336,15 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             
             # Layout avec sidebar et zone d'affichage
             with gr.Row():
-                # Sidebar gauche - Liste des catégories
+                # Sidebar gauche - Liste des catégories CLIQUABLES
                 with gr.Column(scale=1):
                     gr.HTML('<h3 style="color: var(--primary-blue); margin-top: 0;">📂 Catégories</h3>')
                     
-                    categories_sidebar = gr.HTML(value="")
+                    gr.Markdown("""
+                    Cliquez sur une catégorie ci-dessous pour afficher les images correspondantes.
+                    """)
                     
-                    # Boutons pour chaque catégorie
+                    # Boutons pour chaque catégorie (design amélioré, pas de doublon)
                     cat_buttons = {}
                     for cat_id, cat_info in CATEGORIES_POLICE.items():
                         label_display = cat_info.get('label_fr', cat_info['label'])
@@ -2333,15 +2352,18 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                             f"{cat_info['icon']} {label_display}",
                             variant="secondary",
                             size="sm",
-                            elem_id=f"cat_{cat_id}"
+                            elem_id=f"cat_btn_{cat_id}"
                         )
                     
                     # Bouton pour afficher toutes les images
                     show_all_btn = gr.Button(
                         "📋 Toutes les images",
-                        variant="secondary",
+                        variant="primary",
                         size="sm"
                     )
+                    
+                    # Statistiques (s'affiche après catégorisation)
+                    categories_stats = gr.HTML(value="")
                 
                 # Zone principale droite - Affichage des images filtrées
                 with gr.Column(scale=3):
@@ -2355,7 +2377,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             categorize_btn.click(
                 fn=page_categorisation_analyze,
                 inputs=[enquete_state],
-                outputs=[categorize_status, enquete_state, categories_sidebar, gr.State()]
+                outputs=[categorize_status, enquete_state, categories_stats, gr.State()]
             )
             
             # Événements pour chaque bouton de catégorie
