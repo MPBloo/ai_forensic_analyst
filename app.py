@@ -1731,23 +1731,46 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
     print(f"Categories: {categories}")
     print(f"Tags: {tags}")
     
-    # Score de base selon catégories (TOUJOURS APPLICABLE)
+    # Score de base selon catégories ET tags (TOUJOURS APPLICABLE)
     base_score = 0
     critical_categories = {
-        "people": 25,      # Personnes = très pertinent
-        "weapons": 45,     # Armes = extrêmement pertinent
-        "vehicles": 22,    # Véhicules = pertinent
-        "documents": 28,   # Documents = très pertinent
-        "buildings": 18,   # Lieux = pertinent
-        "indoor": 15,      # Intérieur = moyennement pertinent
-        "outdoor": 15,     # Extérieur = moyennement pertinent
-        "objects": 12      # Objets = pertinent
+        "people": 35,      # Personnes = très pertinent (augmenté)
+        "weapons": 50,     # Armes = extrêmement pertinent (augmenté)
+        "vehicles": 30,    # Véhicules = pertinent (augmenté)
+        "documents": 35,   # Documents = très pertinent (augmenté)
+        "buildings": 25,   # Lieux = pertinent (augmenté)
+        "indoor": 20,      # Intérieur = moyennement pertinent (augmenté)
+        "outdoor": 20,     # Extérieur = moyennement pertinent (augmenté)
+        "objects": 18      # Objets = pertinent (augmenté)
     }
     
+    # 1. Score basé sur les catégories
     for cat, points in critical_categories.items():
         if cat in categories:
             base_score += points
             print(f"  Category '{cat}': +{points} points")
+    
+    # 2. Score basé sur les tags (si pas de catégories)
+    if not categories and tags:
+        print(f"  No categories found, using tags instead")
+        tag_to_category = {
+            "people": "people",
+            "vehicles": "vehicles", 
+            "weapons": "weapons",
+            "documents": "documents",
+            "buildings": "buildings",
+            "indoor": "indoor",
+            "outdoor": "outdoor",
+            "objects": "objects",
+            "animals": "objects"  # Les animaux sont considérés comme objets
+        }
+        
+        for tag in tags:
+            if tag in tag_to_category:
+                cat = tag_to_category[tag]
+                if cat in critical_categories:
+                    base_score += critical_categories[cat]
+                    print(f"  Tag '{tag}' → Category '{cat}': +{critical_categories[cat]} points")
     
     score += base_score
     
@@ -1762,7 +1785,7 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
     important_tags = ["people", "vehicles", "documents", "weapons", "buildings"]
     for tag in tags:
         if tag in important_tags:
-            tag_score += 8
+            tag_score += 12  # Augmenté de 8 à 12
     if tag_score > 0:
         score += tag_score
         print(f"  Important tags: +{tag_score} points")
@@ -1788,13 +1811,41 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
         
         # 1. Correspondance exacte des mots-clés (POIDS TRÈS FORT)
         exact_matches = 0
+        
+        # Dictionnaire de correspondance FR-EN pour les mots-clés d'enquête
+        fr_to_en_keywords = {
+            "personne": ["person", "people", "man", "woman", "human", "individual"],
+            "quelqu'un": ["someone", "somebody", "person", "man", "woman"],
+            "arme": ["weapon", "gun", "knife", "blade", "firearm", "pistol", "rifle"],
+            "couteau": ["knife", "blade", "cutting", "sharp"],
+            "crime": ["crime", "criminal", "illegal", "violence", "attack"],
+            "recherche": ["search", "looking", "investigation", "investigate"],
+            "suspect": ["suspect", "suspicious", "person", "individual"],
+            "voiture": ["car", "vehicle", "automobile", "truck"],
+            "bâtiment": ["building", "house", "structure", "construction"],
+            "document": ["document", "paper", "text", "writing"],
+            "lieu": ["place", "location", "area", "site"],
+            "intérieur": ["inside", "interior", "indoor", "room"],
+            "extérieur": ["outside", "exterior", "outdoor", "street"]
+        }
+        
         for word in contexte_words[:20]:  # Top 20 mots du contexte
+            # Correspondance directe
             if word in description:
                 exact_matches += 1
-                score += 12  # +12 points par correspondance exacte
+                score += 15  # Augmenté de 12 à 15
+                print(f"  Direct match '{word}' in description: +15 points")
+            # Correspondance via traduction
+            elif word in fr_to_en_keywords:
+                for en_word in fr_to_en_keywords[word]:
+                    if en_word in description:
+                        exact_matches += 1
+                        score += 15
+                        print(f"  Translation match '{word}' → '{en_word}' in description: +15 points")
+                        break
         
         if exact_matches > 0:
-            print(f"  Exact word matches: {exact_matches} words → +{exact_matches * 12} points")
+            print(f"  Exact word matches: {exact_matches} words → +{exact_matches * 15} points")
         
         # 2. Correspondance partielle (mots racines, préfixes)
         partial_matches = 0
@@ -1854,14 +1905,14 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
 def classify_by_investigation_relevance(score: int) -> str:
     """
     Classifie une image selon son score de pertinence
-    Seuils ajustés pour le nouveau système de scoring :
-    Pertinent: score >= 55
-    À traiter: 25 <= score < 55
-    Non pertinent: score < 25
+    Seuils ajustés pour correspondre aux scores réels observés :
+    Pertinent: score >= 15
+    À traiter: 8 <= score < 15
+    Non pertinent: score < 8
     """
-    if score >= 55:
+    if score >= 15:
         return "pertinent"
-    elif score >= 25:
+    elif score >= 8:
         return "a_traiter"
     else:
         return "non_pertinent"
