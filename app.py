@@ -122,29 +122,91 @@ CUSTOM_CSS = """
     line-height: 1.4;
 }
 
-/* Onglets */
+/* Onglets modernisés */
 .gradio-tabs {
-    border-radius: 8px;
+    border-radius: 12px;
     overflow: hidden;
+    background: white;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+    border: 1px solid rgba(59, 130, 246, 0.1);
+}
+
+.gradio-tabs .tab-nav {
+    background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+    border-bottom: 2px solid #e2e8f0;
+    padding: 8px;
+    display: flex;
+    gap: 4px;
 }
 
 .gradio-tabs .tab-nav button {
-    background-color: var(--light-blue);
-    color: var(--primary-blue);
+    background: transparent;
+    color: #64748b;
     border: none;
     font-weight: 600;
-    padding: 12px 24px;
-    transition: all 0.3s ease;
+    padding: 16px 20px;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    border-radius: 10px;
+    font-size: 1.1em;
+    position: relative;
+    overflow: hidden;
+    min-width: 140px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
 }
 
-.gradio-tabs .tab-nav button.selected {
-    background-color: var(--primary-blue);
-    color: white;
+.gradio-tabs .tab-nav button::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+    transition: left 0.5s;
+}
+
+.gradio-tabs .tab-nav button:hover::before {
+    left: 100%;
 }
 
 .gradio-tabs .tab-nav button:hover {
-    background-color: var(--secondary-blue);
+    background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
     color: white;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(59, 130, 246, 0.3);
+}
+
+.gradio-tabs .tab-nav button.selected {
+    background: linear-gradient(135deg, #1e40af 0%, #1e3a8a 100%);
+    color: white;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(30, 64, 175, 0.4);
+    border: 2px solid rgba(255, 255, 255, 0.2);
+}
+
+.gradio-tabs .tab-nav button.selected::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 30px;
+    height: 3px;
+    background: white;
+    border-radius: 2px;
+}
+
+/* Icônes plus grandes dans les onglets */
+.gradio-tabs .tab-nav button {
+    font-size: 1.2em;
+}
+
+.gradio-tabs .tab-nav button span {
+    font-size: 1.4em;
+    margin-right: 8px;
 }
 
 /* Cartes et sections */
@@ -280,6 +342,22 @@ textarea {
         font-size: 1.1em;
         margin-top: 12px;
         max-width: 100%;
+    }
+    
+    /* Onglets responsive */
+    .gradio-tabs .tab-nav {
+        flex-wrap: wrap;
+        gap: 2px;
+    }
+    
+    .gradio-tabs .tab-nav button {
+        min-width: 120px;
+        padding: 12px 16px;
+        font-size: 1em;
+    }
+    
+    .gradio-tabs .tab-nav button span {
+        font-size: 1.2em;
     }
     
     .section-card {
@@ -884,20 +962,20 @@ def page_recherche_search(query: str, current_state):
                 <p style="margin: 0 0 8px 0; font-weight: 600; color: var(--primary-blue);">🏷️ Tags :</p>
                 <div style="display: flex; flex-wrap: wrap; gap: 8px;">
         """
-            
-            for tag in analysis['tags']:
-                html += f"""
-                        <span style="background: var(--secondary-blue); color: white; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; font-weight: 500;">
-                            {tag}
-                        </span>
-                """
-            
-            if not analysis['tags']:
-                html += '<span style="color: #999; font-style: italic;">Aucun tag</span>'
-            
-            html += """
-                    </div>
+        
+        for tag in analysis['tags']:
+            html += f"""
+                    <span style="background: var(--secondary-blue); color: white; padding: 5px 12px; border-radius: 15px; font-size: 0.9em; font-weight: 500;">
+                        {tag}
+                    </span>
+            """
+        
+        if not analysis['tags']:
+            html += '<span style="color: #999; font-style: italic;">Aucun tag</span>'
+        
+        html += """
                 </div>
+            </div>
             """
         
         html += """
@@ -1118,8 +1196,8 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             vqa_answer = ask_vqa_question(image, question)
             print(f"{category} VQA Q{i+1}/{total_questions}: '{vqa_answer}'")
             
-            if vqa_answer:
-                vqa_lower = vqa_answer.lower()
+        if vqa_answer:
+            vqa_lower = vqa_answer.lower()
                 
                 # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
                 exclude_list = config.get("exclude_keywords", [])
@@ -1146,7 +1224,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
                     positive_answers += 1
-                    score += 25 * config["weight"]
+                score += 25 * config["weight"]
                     print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
                 
                 # Réponses négatives claires
@@ -1289,29 +1367,29 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
         
         if count > 0:  # Afficher seulement les catégories avec des images
             percentage = (count / total_images * 100) if total_images > 0 else 0
-            
-            html += f"""
+        
+        html += f"""
             <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
                  onclick="triggerGradioButton('{cat_id}')"
                  onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <div>
+                <div>
                         <span style="font-size: 1.4em; margin-right: 8px;">{cat_info['icon']}</span>
                         <strong style="color: var(--dark-text); font-size: 1em;">{label_display}</strong>
-                    </div>
-                    <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
-                        {count}
-                    </span>
                 </div>
+                    <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
+                    {count}
+                </span>
+            </div>
                 <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 8px; margin-top: 8px;">
                     <div style="background: {cat_info['color']}; height: 100%; width: {percentage:.1f}%; transition: width 0.5s;"></div>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 0.8em; color: #888; text-align: right;">
                     {percentage:.1f}% des images • Cliquez pour filtrer
-                </p>
-            </div>
-            """
+            </p>
+        </div>
+        """
     
     # Bouton "Toutes les images"
     html += f"""
@@ -2230,8 +2308,8 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
     gr.HTML("""
         <div class="main-header">
             <div class="header-content">
-                <h1>🛡️ IArgos</h1>
-                <p>Système Intelligent d'Analyse et de Catégorisation de Données d'Enquête</p>
+            <h1>🛡️ IArgos</h1>
+            <p>Système Intelligent d'Analyse et de Catégorisation de Données d'Enquête</p>
             </div>
         </div>
     """)
@@ -2427,24 +2505,24 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                         gr.Markdown("""
                         Cliquez sur une catégorie ci-dessous pour afficher les images correspondantes.
                         """)
-                        
-                        # Boutons pour chaque catégorie
-                        cat_buttons = {}
-                        for cat_id, cat_info in CATEGORIES_POLICE.items():
-                            label_display = cat_info.get('label_fr', cat_info['label'])
-                            cat_buttons[cat_id] = gr.Button(
-                                f"{cat_info['icon']} {label_display}",
-                                variant="secondary",
-                                size="sm",
+                    
+                    # Boutons pour chaque catégorie
+                    cat_buttons = {}
+                    for cat_id, cat_info in CATEGORIES_POLICE.items():
+                        label_display = cat_info.get('label_fr', cat_info['label'])
+                        cat_buttons[cat_id] = gr.Button(
+                            f"{cat_info['icon']} {label_display}",
+                            variant="secondary",
+                            size="sm",
                                 elem_id=f"cat_btn_{cat_id}"
-                            )
-                        
-                        # Bouton pour afficher toutes les images
-                        show_all_btn = gr.Button(
-                            "📋 Toutes les images",
-                            variant="primary",
-                            size="sm"
                         )
+                    
+                    # Bouton pour afficher toutes les images
+                    show_all_btn = gr.Button(
+                        "📋 Toutes les images",
+                            variant="primary",
+                        size="sm"
+                    )
                     
                     # ÉTAT 2: Statistiques cliquables (visibles après catégorisation)
                     with gr.Group(visible=False) as stats_group:
