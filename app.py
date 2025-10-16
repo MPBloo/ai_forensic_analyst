@@ -1224,7 +1224,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
                     positive_answers += 1
-                score += 25 * config["weight"]
+                    score += 25 * config["weight"]
                     print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
                 
                 # Réponses négatives claires
