@@ -1413,41 +1413,55 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
     
     <script>
     function triggerGradioButton(categoryId) {{
-        console.log('Triggering Gradio button for category:', categoryId);
+        console.log('=== DEBUG FILTRAGE ===');
+        console.log('Category ID:', categoryId);
         
         // Chercher tous les boutons Gradio dans la page
         const buttons = document.querySelectorAll('button');
+        console.log('Total buttons found:', buttons.length);
+        
+        // Afficher tous les boutons pour debug
+        console.log('All buttons:');
+        buttons.forEach((btn, index) => {{
+            console.log(`Button ${{index}}: "${{btn.textContent}}" (ID: ${{btn.id}})`);
+        }});
+        
         let targetButton = null;
         
         // Chercher le bouton correspondant par texte
         for (let button of buttons) {{
             const buttonText = button.textContent || button.innerText;
+            console.log('Checking button:', buttonText);
+            
             if (categoryId === 'all' && buttonText.includes('FILTER_ALL')) {{
                 targetButton = button;
+                console.log('Found FILTER_ALL button');
                 break;
             }} else if (buttonText.includes('FILTER_' + categoryId.toUpperCase())) {{
                 targetButton = button;
+                console.log('Found category button:', buttonText);
                 break;
             }}
         }}
         
         if (targetButton) {{
-            console.log('Found target button, clicking...');
+            console.log('✅ Found target button, clicking...');
             targetButton.click();
         }} else {{
-            console.error('Could not find button for category:', categoryId);
-            console.log('Available buttons:', Array.from(buttons).map(b => b.textContent));
+            console.error('❌ Could not find button for category:', categoryId);
             
             // Fallback: essayer de trouver par ID
             const buttonId = categoryId === 'all' ? 'hidden_show_all' : 'hidden_cat_' + categoryId;
+            console.log('Trying fallback with ID:', buttonId);
             const fallbackButton = document.getElementById(buttonId);
             if (fallbackButton) {{
-                console.log('Found fallback button by ID');
+                console.log('✅ Found fallback button by ID');
                 fallbackButton.click();
             }} else {{
-                console.error('No fallback button found either');
+                console.error('❌ No fallback button found either');
             }}
         }}
+        console.log('=== END DEBUG ===');
     }}
     </script>
     """
@@ -1456,7 +1470,14 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
 
 def page_categorisation_filter(category_id: str, current_state):
     """Filtre et affiche les images d'une catégorie spécifique"""
+    print(f"=== FILTRAGE DEBUG ===")
+    print(f"Category ID reçu: {category_id}")
+    print(f"Current state: {current_state is not None}")
+    if current_state:
+        print(f"Nombre d'analyses: {len(current_state.analyses)}")
+    
     if current_state is None or len(current_state.analyses) == 0:
+        print("❌ Aucune analyse trouvée")
         return """
         <div class="info-message">
             ⚠️ Aucune image catégorisée. Cliquez d'abord sur "Catégoriser les images".
@@ -1477,7 +1498,10 @@ def page_categorisation_filter(category_id: str, current_state):
         cat_info = CATEGORIES_POLICE.get(category_id, {"label": "Catégorie inconnue", "icon": "❓"})
         title = f"{cat_info['icon']} {cat_info['label']}"
     
+    print(f"Images filtrées: {len(filtered_images)}")
+    
     if len(filtered_images) == 0:
+        print("❌ Aucune image trouvée dans cette catégorie")
         return f"""
         <div class="info-message">
             ℹ️ Aucune image trouvée dans la catégorie "<strong>{title}</strong>".
