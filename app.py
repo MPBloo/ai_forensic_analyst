@@ -66,25 +66,60 @@ CUSTOM_CSS = """
 
 /* En-tête principal */
 .main-header {
-    background: linear-gradient(135deg, var(--primary-blue) 0%, var(--secondary-blue) 100%);
+    background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 50%, #60a5fa 100%);
     color: white;
-    padding: 30px 40px;
-    border-radius: 8px;
-    margin-bottom: 30px;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    padding: 40px 50px;
+    border-radius: 16px;
+    margin-bottom: 35px;
+    box-shadow: 0 8px 32px rgba(30, 58, 138, 0.3);
+    position: relative;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.main-header::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(45deg, transparent 30%, rgba(255, 255, 255, 0.1) 50%, transparent 70%);
+    animation: shimmer 3s infinite;
+}
+
+@keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
 }
 
 .main-header h1 {
     margin: 0;
-    font-size: 2.5em;
-    font-weight: 600;
-    letter-spacing: -0.5px;
+    font-size: 3.2em;
+    font-weight: 700;
+    letter-spacing: -1px;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    font-family: 'Segoe UI', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+    position: relative;
+    z-index: 1;
+}
+
+.main-header .header-content {
+    position: relative;
+    z-index: 2;
 }
 
 .main-header p {
-    margin: 10px 0 0 0;
-    font-size: 1.1em;
+    margin: 15px 0 0 0;
+    font-size: 1.3em;
     opacity: 0.95;
+    font-weight: 400;
+    letter-spacing: 0.3px;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    position: relative;
+    z-index: 1;
+    max-width: 600px;
+    line-height: 1.4;
 }
 
 /* Onglets */
@@ -221,11 +256,32 @@ textarea {
     color: white;
 }
 
+/* Boutons cachés pour le filtrage */
+.hidden-filter-btn {
+    display: none !important;
+    visibility: hidden !important;
+    position: absolute !important;
+    left: -9999px !important;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
-    .main-header h1 {
-        font-size: 1.8em;
+    .main-header {
+        padding: 25px 30px;
+        margin-bottom: 25px;
     }
+    
+    .main-header h1 {
+        font-size: 2.2em;
+        letter-spacing: -0.5px;
+    }
+    
+    .main-header p {
+        font-size: 1.1em;
+        margin-top: 12px;
+        max-width: 100%;
+    }
+    
     .section-card {
         padding: 15px;
     }
@@ -1219,8 +1275,7 @@ def page_categorisation_analyze(current_state):
 
 def generate_clickable_categories_stats(categories_count: dict) -> str:
     """
-    Génère le HTML des statistiques cliquables pour filtrer les images
-    (Remplace les boutons Gradio par des éléments HTML cliquables)
+    Génère le HTML des statistiques avec instructions pour les boutons Gradio
     """
     html = """
     <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px; border: 2px solid var(--border-gray);">
@@ -1237,7 +1292,7 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
             
             html += f"""
             <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
-                 onclick="filterByCategory('{cat_id}')"
+                 onclick="triggerGradioButton('{cat_id}')"
                  onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
@@ -1261,7 +1316,7 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
     # Bouton "Toutes les images"
     html += f"""
         <div style="margin: 15px 0; padding: 15px; background: var(--light-blue); border-radius: 8px; cursor: pointer; text-align: center; transition: all 0.3s ease;" 
-             onclick="filterByCategory('all')"
+             onclick="triggerGradioButton('all')"
              onmouseover="this.style.background='var(--accent-blue)'; this.style.color='white'" 
              onmouseout="this.style.background='var(--light-blue)'; this.style.color='var(--primary-blue)'">
             <p style="margin: 0; font-weight: 600; color: var(--primary-blue); font-size: 1.1em;">
@@ -1279,18 +1334,41 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
     </div>
     
     <script>
-    function filterByCategory(categoryId) {{
-        console.log('Filtering by category:', categoryId);
+    function triggerGradioButton(categoryId) {{
+        console.log('Triggering Gradio button for category:', categoryId);
         
-        // Déclencher le bouton Gradio caché correspondant
-        const buttonId = categoryId === 'all' ? 'hidden_show_all' : 'hidden_cat_' + categoryId;
-        const hiddenButton = document.getElementById(buttonId);
+        // Chercher tous les boutons Gradio dans la page
+        const buttons = document.querySelectorAll('button');
+        let targetButton = null;
         
-        if (hiddenButton) {{
-            // Simuler un clic sur le bouton caché
-            hiddenButton.click();
+        // Chercher le bouton correspondant par texte
+        for (let button of buttons) {{
+            const buttonText = button.textContent || button.innerText;
+            if (categoryId === 'all' && buttonText.includes('FILTER_ALL')) {{
+                targetButton = button;
+                break;
+            }} else if (buttonText.includes('FILTER_' + categoryId.toUpperCase())) {{
+                targetButton = button;
+                break;
+            }}
+        }}
+        
+        if (targetButton) {{
+            console.log('Found target button, clicking...');
+            targetButton.click();
         }} else {{
-            console.error('Hidden button not found:', buttonId);
+            console.error('Could not find button for category:', categoryId);
+            console.log('Available buttons:', Array.from(buttons).map(b => b.textContent));
+            
+            // Fallback: essayer de trouver par ID
+            const buttonId = categoryId === 'all' ? 'hidden_show_all' : 'hidden_cat_' + categoryId;
+            const fallbackButton = document.getElementById(buttonId);
+            if (fallbackButton) {{
+                console.log('Found fallback button by ID');
+                fallbackButton.click();
+            }} else {{
+                console.error('No fallback button found either');
+            }}
         }}
     }}
     </script>
@@ -2151,8 +2229,10 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
     # En-tête principal
     gr.HTML("""
         <div class="main-header">
-            <h1>🛡️ IArgos</h1>
-            <p>Système Intelligent d'Analyse et de Catégorisation de Données d'Enquête</p>
+            <div class="header-content">
+                <h1>🛡️ IArgos</h1>
+                <p>Système Intelligent d'Analyse et de Catégorisation de Données d'Enquête</p>
+            </div>
         </div>
     """)
     
@@ -2266,17 +2346,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
         with gr.Tab("🔍 Recherche", id="recherche"):
             gr.HTML('<div class="section-title">🔍 Recherche textuelle dans les images</div>')
             
-            gr.Markdown("""
-            ## Fonctionnement
-            
-            Cette page vous permet de rechercher des images en fonction de leur contenu textuel :
-            - Recherche dans les **descriptions** générées par l'IA
-            - Recherche dans les **tags** extraits automatiquement
-            - **Score de pertinence** basé sur le contexte de votre enquête
-            
-            Les images sont d'abord analysées par BLIP pour générer des descriptions et tags.
-            """)
-            
             # Bouton pour lancer l'analyse
             analyze_status = gr.HTML(value="")
             
@@ -2333,23 +2402,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
         # ====================================================================
         with gr.Tab("🗂️ Catégorisation", id="categorisation"):
             gr.HTML('<div class="section-title">🗂️ Catégorisation automatique des images</div>')
-            
-            gr.Markdown("""
-            ## Fonctionnement
-            
-            Cette page classe automatiquement vos images dans des catégories pertinentes pour l'enquête :
-            - **👤 Personnes** : Suspects, témoins, visages
-            - **🚗 Véhicules** : Voitures, motos, plaques
-            - **⚠️ Armes/Suspects** : Armes, objets dangereux (seuil strict)
-            - **📄 Documents/Textes** : Papiers, textes, preuves écrites
-            - **🏢 Bâtiments/Lieux** : Bâtiments, scènes de crime
-            - **🌳 Extérieur** : Scènes extérieures, rues, nature
-            - **🏠 Intérieur** : Scènes intérieures, pièces
-            - **📦 Objets** : Preuves matérielles, équipements
-            - **🐾 Animaux** : Chiens, chats, animaux domestiques
-            
-            Les images sont analysées par l'IA BLIP avec plusieurs questions par catégorie pour plus de précision.
-            """)
             
             # Bouton pour lancer la catégorisation
             categorize_status = gr.HTML(value="")
@@ -2408,15 +2460,17 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                         hidden_cat_buttons = {}
                         for cat_id, cat_info in CATEGORIES_POLICE.items():
                             hidden_cat_buttons[cat_id] = gr.Button(
-                                f"Hidden_{cat_id}",
+                                f"FILTER_{cat_id.upper()}",
                                 visible=False,
-                                elem_id=f"hidden_cat_{cat_id}"
+                                elem_id=f"hidden_cat_{cat_id}",
+                                elem_classes=["hidden-filter-btn"]
                             )
                         
                         hidden_show_all_btn = gr.Button(
-                            "Hidden_All",
+                            "FILTER_ALL",
                             visible=False,
-                            elem_id="hidden_show_all"
+                            elem_id="hidden_show_all",
+                            elem_classes=["hidden-filter-btn"]
                         )
                 
                 # Zone principale droite - Affichage des images filtrées
