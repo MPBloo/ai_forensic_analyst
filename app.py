@@ -1520,7 +1520,7 @@ def page_categorisation_filter(category_id: str, current_state):
             </p>
         </div>
         
-        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px;">
     """
     
     for analysis in filtered_images:
@@ -1537,11 +1537,28 @@ def page_categorisation_filter(category_id: str, current_state):
                     </span>
                     """
         
+        # Générer l'aperçu de l'image
+        image_preview = ""
+        if "image" in analysis and analysis["image"] is not None:
+            try:
+                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                if image_base64:
+                    image_preview = f"""
+                    <div style="margin: 10px 0; text-align: center;">
+                        <img src="{image_base64}" style="max-width: 100%; max-height: 200px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);" alt="Aperçu de l'image" />
+                    </div>
+                    """
+            except Exception as e:
+                print(f"Erreur génération aperçu image: {e}")
+                image_preview = ""
+        
         html += f"""
         <div style="background: white; border: 2px solid var(--border-gray); border-radius: 10px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             <h4 style="margin: 0 0 10px 0; color: var(--primary-blue);">
                 📄 {analysis['filename']}
             </h4>
+            
+            {image_preview}
             
             <div style="margin: 10px 0;">
                 <p style="margin: 0 0 5px 0; font-weight: 600; color: var(--primary-blue);">📝 Description :</p>
@@ -1962,7 +1979,7 @@ def page_analyse_filter_by_relevance(relevance_category: str, current_state):
             </p>
         </div>
         
-        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px;">
     """
     
     for analysis in filtered_images:
@@ -1984,6 +2001,21 @@ def page_analyse_filter_by_relevance(relevance_category: str, current_state):
                     </span>
                     """
         
+        # Générer l'aperçu de l'image
+        image_preview = ""
+        if "image" in analysis and analysis["image"] is not None:
+            try:
+                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                if image_base64:
+                    image_preview = f"""
+                    <div style="margin: 10px 0; text-align: center;">
+                        <img src="{image_base64}" style="max-width: 100%; max-height: 200px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);" alt="Aperçu de l'image" />
+                    </div>
+                    """
+            except Exception as e:
+                print(f"Erreur génération aperçu image: {e}")
+                image_preview = ""
+        
         html += f"""
         <div style="background: white; border: 3px solid {cat_info['color']}; border-radius: 12px; padding: 18px; box-shadow: 0 3px 6px rgba(0,0,0,0.15); transition: transform 0.2s;"
              onmouseover="this.style.transform='translateY(-5px)'" onmouseout="this.style.transform='translateY(0)'">
@@ -1996,6 +2028,8 @@ def page_analyse_filter_by_relevance(relevance_category: str, current_state):
                     {score}
                 </div>
             </div>
+            
+            {image_preview}
             
             <div style="background: #f8f9fa; padding: 10px; border-radius: 6px; margin: 10px 0;">
                 <p style="margin: 0; color: #555; line-height: 1.6; font-size: 0.95em;">
