@@ -1350,29 +1350,29 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
         
         if count > 0:  # Afficher seulement les catégories avec des images
             percentage = (count / total_images * 100) if total_images > 0 else 0
-        
-        html += f"""
+            
+            html += f"""
             <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
                  onclick="triggerGradioButton('{cat_id}')"
                  onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <div>
+                    <div>
                         <span style="font-size: 1.4em; margin-right: 8px;">{cat_info['icon']}</span>
                         <strong style="color: var(--dark-text); font-size: 1em;">{label_display}</strong>
-                </div>
+                    </div>
                     <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
-                    {count}
-                </span>
-            </div>
+                        {count}
+                    </span>
+                </div>
                 <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 8px; margin-top: 8px;">
                     <div style="background: {cat_info['color']}; height: 100%; width: {percentage:.1f}%; transition: width 0.5s;"></div>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 0.8em; color: #888; text-align: right;">
                     {percentage:.1f}% des images • Cliquez pour filtrer
-            </p>
-        </div>
-        """
+                </p>
+            </div>
+            """
     
     # Bouton "Toutes les images"
     html += f"""
