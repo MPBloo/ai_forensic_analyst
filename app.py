@@ -286,15 +286,6 @@ textarea {
 }
 
 /* Messages de statut */
-.success-message {
-    background: #d4edda;
-    color: #155724;
-    border: 1px solid #c3e6cb;
-    padding: 12px 20px;
-    border-radius: 6px;
-    font-weight: 500;
-}
-
 .info-message {
     background: var(--light-blue);
     color: var(--primary-blue);
@@ -630,27 +621,13 @@ def page_recherche_analyze_if_needed(current_state):
             break
     
     if needs_analysis:
-        status_msg = f"""
-        <div class="info-message">
-            🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP...<br>
-            Veuillez patienter quelques instants.
-        </div>
-        """
+        gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP... Veuillez patienter.")
         current_state = analyze_all_images(current_state)
-        status_msg = f"""
-        <div class="success-message">
-            ✅ {len(current_state.images)} image(s) analysée(s) avec succès !<br>
-            Utilisez la barre de recherche ci-dessous.
-        </div>
-        """
+        gr.Info(f"✅ {len(current_state.images)} image(s) analysée(s) avec succès ! Utilisez la barre de recherche ci-dessous.")
     else:
-        status_msg = f"""
-        <div class="success-message">
-            ✅ {len(current_state.analyses)} image(s) déjà analysée(s) et prêtes pour la recherche.
-        </div>
-        """
+        gr.Info(f"✅ {len(current_state.analyses)} image(s) déjà analysée(s) et prêtes pour la recherche.")
     
-    return status_msg, current_state
+    return "", current_state
 
 def page_recherche_search(query: str, current_state):
     """
@@ -1348,18 +1325,14 @@ def page_categorisation_analyze(current_state):
                 if cat in categories_count:
                     categories_count[cat] += 1
     
-    status_msg = f"""
-    <div class="success-message">
-        ✅ {len(current_state.images)} image(s) catégorisée(s) avec succès !<br>
-        Cliquez sur une catégorie à gauche pour voir les images correspondantes.
-    </div>
-    """
+    # Notification de succès
+    gr.Info(f"✅ {len(current_state.images)} image(s) catégorisée(s) avec succès ! Cliquez sur une catégorie à gauche.")
     
     # Générer le HTML des statistiques cliquables
     stats_html = generate_clickable_categories_stats(categories_count)
     
     # Retourner avec changement d'état : masquer boutons, afficher stats
-    return status_msg, current_state, stats_html, categories_count, gr.Group(visible=False), gr.Group(visible=True)
+    return "", current_state, stats_html, categories_count, gr.Group(visible=False), gr.Group(visible=True)
 
 def generate_clickable_categories_stats(categories_count: dict) -> str:
     """
@@ -1908,14 +1881,10 @@ def page_analyse_sort_all(current_state):
         
         print(f"Image {idx}: score={relevance_score}, category={relevance_category}")
     
-    status_msg = f"""
-    <div class="success-message">
-        ✅ {len(current_state.images)} image(s) triée(s) par pertinence !<br>
-        🟢 Pertinentes: {relevance_counts['pertinent']} | 🟡 À traiter: {relevance_counts['a_traiter']} | 🔴 Non pertinentes: {relevance_counts['non_pertinent']}
-    </div>
-    """
+    # Notification de succès
+    gr.Info(f"✅ {len(current_state.images)} image(s) triée(s) par pertinence ! 🟢 Pertinentes: {relevance_counts['pertinent']} | 🟡 À traiter: {relevance_counts['a_traiter']} | 🔴 Non pertinentes: {relevance_counts['non_pertinent']}")
     
-    return status_msg, current_state, relevance_counts
+    return "", current_state, relevance_counts
 
 def page_analyse_filter_by_relevance(relevance_category: str, current_state):
     """
