@@ -245,6 +245,28 @@ CUSTOM_CSS = """
     box-shadow: 0 4px 8px rgba(0,0,0,0.2) !important;
 }
 
+/* Bouton Envoyer le rapport - Gros et vert */
+.send-report-btn {
+    background: linear-gradient(135deg, #28a745 0%, #20c997 100%) !important;
+    color: white !important;
+    font-size: 1.4em !important;
+    font-weight: 700 !important;
+    padding: 20px 50px !important;
+    border-radius: 12px !important;
+    border: none !important;
+    box-shadow: 0 6px 20px rgba(40, 167, 69, 0.3) !important;
+    transition: all 0.3s ease !important;
+    min-height: 70px !important;
+    width: 100% !important;
+    margin: 20px 0 !important;
+}
+
+.send-report-btn:hover {
+    background: linear-gradient(135deg, #218838 0%, #1ea179 100%) !important;
+    transform: translateY(-3px) !important;
+    box-shadow: 0 8px 25px rgba(40, 167, 69, 0.4) !important;
+}
+
 /* Zone de dépôt de fichiers */
 .upload-zone {
     border: 2px dashed var(--accent-blue) !important;
@@ -2783,6 +2805,17 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                 </div>
             """)
             
+            gr.Markdown("---")
+            
+            # Bouton Envoyer le rapport
+            send_report_btn = gr.Button(
+                "📤 Envoyer le rapport",
+                variant="primary",
+                size="lg",
+                elem_classes=["send-report-btn"],
+                scale=1
+            )
+            
             gr.Markdown("""
             ---
             ### 💡 Conseils d'utilisation
@@ -2816,6 +2849,17 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                 fn=lambda state: page_analyse_filter_by_relevance("non_pertinent", state),
                 inputs=[enquete_state],
                 outputs=[analyse_display]
+            )
+            
+            # Événement pour le bouton Envoyer le rapport
+            def send_report_action():
+                gr.Info("📤 Rapport prêt à être envoyé ! (Fonctionnalité à venir)")
+                return None
+            
+            send_report_btn.click(
+                fn=send_report_action,
+                inputs=[],
+                outputs=[]
             )
             
             gr.Markdown("---")
