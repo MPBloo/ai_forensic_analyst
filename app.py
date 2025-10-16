@@ -1198,28 +1198,28 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
             
         if vqa_answer:
             vqa_lower = vqa_answer.lower()
+            
+            # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
+            exclude_list = config.get("exclude_keywords", [])
+            if exclude_list:
+                # Vérifier si des mots d'exclusion sont présents
+                excluded_found = [e for e in exclude_list if e in vqa_lower]
                 
-                # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
-                exclude_list = config.get("exclude_keywords", [])
-                if exclude_list:
-                    # Vérifier si des mots d'exclusion sont présents
-                    excluded_found = [e for e in exclude_list if e in vqa_lower]
+                if excluded_found:
+                    # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
+                    weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
+                    has_weapon_word = any(w in vqa_lower for w in weapon_words)
                     
-                    if excluded_found:
-                        # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
-                        weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
-                        has_weapon_word = any(w in vqa_lower for w in weapon_words)
-                        
-                        # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
-                        if not has_weapon_word and config.get("exclude_only_if_alone", False):
-                            print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
-                            has_exclusion = True
-                            score -= 20  # Pénalité
-                            continue
-                        elif not has_weapon_word:
-                            # Petite pénalité mais pas exclusion totale
-                            score -= 5
-                            print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
+                    # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
+                    if not has_weapon_word and config.get("exclude_only_if_alone", False):
+                        print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
+                        has_exclusion = True
+                        score -= 20  # Pénalité
+                        continue
+                    elif not has_weapon_word:
+                        # Petite pénalité mais pas exclusion totale
+                        score -= 5
+                        print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
                 
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
