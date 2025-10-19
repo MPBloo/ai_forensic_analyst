@@ -12,6 +12,7 @@ from io import BytesIO
 # Configuration du device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 # Chargement des modèles BLIP (lazy loading pour économiser la mémoire)
 processor = None
 caption_model = None
@@ -21,37 +22,13 @@ def load_models():
     """Charge les modèles BLIP si nécessaire"""
     global processor, caption_model, vqa_model
     if processor is None:
-        print("🔄 Chargement des modèles BLIP...")
+        print(" Chargement des modèles BLIP...")
         processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
         caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
         vqa_model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base").to(device)
-        print("✅ Modèles BLIP chargés avec succès !")
+        print("Modèles BLIP chargés avec succès !")
 
-# Chargement de Mistral 7B pour analyse de texte (lazy loading)
-text_classifier = None
-
-def load_text_model():
-    """Charge Mistral 7B Instruct pour analyse de texte"""
-    global text_classifier
-    if text_classifier is None:
-        print("🔄 Chargement de Mistral 7B Instruct...")
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        
-        model_name = "mistralai/Mistral-7B-Instruct-v0.2"
-        
-        # Charger avec quantization pour économiser mémoire
-        text_classifier = {
-            "tokenizer": AutoTokenizer.from_pretrained(model_name),
-            "model": AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                load_in_8bit=True  # Quantization 8-bit pour GPU limité
-            )
-        }
-        print("✅ Mistral 7B chargé avec succès !")
-
-# CSS personnalisé - Style professionnel bleu sobre (police)
+# CSS personnalisé 
 CUSTOM_CSS = """
 /* Palette de couleurs police française */
 :root {
@@ -379,11 +356,10 @@ textarea {
 }
 """
 
-# Structure de données globale pour stocker l'état de l'enquête
+# Structure de données globale pour stocker l'état de l'enquête   ____  on le remplit à la page d'accueil 
 class EnqueteData:
     def __init__(self):
         self.images = []  # Liste des images uploadées
-        self.descriptions = []  # Descriptions IA des images
         self.enquete_info = {
             "titre": "",
             "contexte": "",
@@ -392,14 +368,6 @@ class EnqueteData:
         }
         self.analyses = {}  # Résultats d'analyse par image
         self.tags_global = []  # Tous les tags extraits
-        
-    def to_dict(self):
-        """Convertit l'état en dictionnaire sérialisable"""
-        return {
-            "enquete_info": self.enquete_info,
-            "nombre_images": len(self.images),
-            "tags_global": self.tags_global
-        }
 
 # ============================================================================
 # FONCTIONS D'ANALYSE IA - BLIP
@@ -408,10 +376,12 @@ class EnqueteData:
 def generate_caption(image: Image.Image) -> str:
     """Génère une description textuelle de l'image avec BLIP"""
     load_models()
-    inputs = processor(image, return_tensors="pt").to(device)
-    out = caption_model.generate(**inputs, max_length=100)
+    inputs = processor(image, return_tensors="pt").to(device) # transforme l'imahge en tenseurs et retourne un dico et utilise pytorch
+    out = caption_model.generate(**inputs, max_length=100) #attention ici on se limite à 100 tokens 
     caption = processor.decode(out[0], skip_special_tokens=True)
     return caption
+
+""" Après coup, cette fonction est sans doute inutile et un peu surfaite"""
 
 def extract_tags_from_description(description: str) -> List[str]:
     """Extrait des tags simples de la description (EN ANGLAIS pour compatibilité)"""
@@ -436,6 +406,11 @@ def extract_tags_from_description(description: str) -> List[str]:
             tags.append(tag)
     
     return tags
+
+
+
+"""sans doute inutile"""
+
 
 def calculate_relevance_score(description: str, tags: List[str], contexte_enquete: str) -> int:
     """
@@ -467,6 +442,12 @@ def calculate_relevance_score(description: str, tags: List[str], contexte_enquet
     
     # Normaliser entre 0 et 100
     return min(100, score)
+
+
+
+
+
+
 
 def analyze_image_complete(image_data: dict, contexte_enquete: str, image_id: int) -> dict:
     """
@@ -1232,7 +1213,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
                 # Réponses positives claires
                 if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
                     positive_answers += 1
-                    score += 25 * config["weight"]
+                score += 25 * config["weight"]
                     print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
                 
                 # Réponses négatives claires
@@ -1372,29 +1353,29 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
         
         if count > 0:  # Afficher seulement les catégories avec des images
             percentage = (count / total_images * 100) if total_images > 0 else 0
-            
-            html += f"""
+        
+        html += f"""
             <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
                  onclick="triggerGradioButton('{cat_id}')"
                  onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <div>
+                <div>
                         <span style="font-size: 1.4em; margin-right: 8px;">{cat_info['icon']}</span>
                         <strong style="color: var(--dark-text); font-size: 1em;">{label_display}</strong>
-                    </div>
-                    <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
-                        {count}
-                    </span>
                 </div>
+                    <span style="background: {cat_info['color']}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: 700; font-size: 0.9em;">
+                    {count}
+                </span>
+            </div>
                 <div style="background: #e9ecef; border-radius: 8px; overflow: hidden; height: 8px; margin-top: 8px;">
                     <div style="background: {cat_info['color']}; height: 100%; width: {percentage:.1f}%; transition: width 0.5s;"></div>
                 </div>
                 <p style="margin: 6px 0 0 0; font-size: 0.8em; color: #888; text-align: right;">
                     {percentage:.1f}% des images • Cliquez pour filtrer
-                </p>
-            </div>
-            """
+            </p>
+        </div>
+        """
     
     # Bouton "Toutes les images"
     html += f"""
@@ -2608,7 +2589,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
                             visible=False,
                             elem_id="hidden_show_all",
                             elem_classes=["hidden-filter-btn"]
-                        )
+                    )
                 
                 # Zone principale droite - Affichage des images filtrées
                 with gr.Column(scale=3):
