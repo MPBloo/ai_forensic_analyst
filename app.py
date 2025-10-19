@@ -1653,6 +1653,11 @@ def fallback_text_analysis(text_content: str, contexte_enquete: str) -> dict:
     Analyse de secours si Mistral échoue
     Analyse basique par mots-clés
     """
+
+
+#ok 
+
+
     text_lower = text_content.lower()
     score = 50  # Score de base
     reasons = []
