@@ -1,5 +1,5 @@
 import gradio as gr
-from transformers import BlipProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
+from transformers import Blip2Processor, Blip2ForConditionalGeneration, BitsAndBytesConfig
 from PIL import Image
 import torch
 from typing import List, Dict, Tuple, Optional
@@ -11,22 +11,46 @@ from io import BytesIO
 
 # Configuration du device
 device = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "Salesforce/blip2-opt-2.7b"
+# Dtype utilisé pour les tenseurs d'entrée envoyés au modèle (doit matcher le
+# compute_dtype de la quantization 4-bit sur GPU ; fp32 en fallback CPU)
+MODEL_DTYPE = torch.float16 if device == "cuda" else torch.float32
 
-
-# Chargement des modèles BLIP (lazy loading pour économiser la mémoire)
+# Chargement du modèle BLIP-2 (lazy loading). Un seul modèle sert à la fois
+# au captioning et au VQA (BLIP-2 fait les deux via le même decoder, piloté
+# par le prompt texte optionnel passé au processor).
 processor = None
-caption_model = None
-vqa_model = None
+model = None
 
 def load_models():
-    """Charge les modèles BLIP si nécessaire"""
-    global processor, caption_model, vqa_model
-    if processor is None:
-        print(" Chargement des modèles BLIP...")
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
-        vqa_model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base").to(device)
-        print("Modèles BLIP chargés avec succès !")
+    """Charge BLIP-2 si nécessaire : 4-bit (nf4) sur GPU, fp32 sur CPU en fallback explicite"""
+    global processor, model
+    if processor is not None:
+        return
+
+    processor = Blip2Processor.from_pretrained(MODEL_NAME)
+
+    if device == "cuda":
+        print(f" Chargement de {MODEL_NAME} en 4-bit (nf4, double quant)...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = Blip2ForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            quantization_config=quantization_config,
+            device_map="auto",
+        )
+    else:
+        print(
+            " CUDA indisponible : la quantization 4-bit (bitsandbytes) nécessite un GPU. "
+            f"Chargement de {MODEL_NAME} en fp32 sur CPU à la place — l'inférence sera très lente."
+        )
+        model = Blip2ForConditionalGeneration.from_pretrained(MODEL_NAME, torch_dtype=torch.float32).to(device)
+
+    print(f"{MODEL_NAME} chargé avec succès !")
 
 # CSS personnalisé 
 CUSTOM_CSS = """
@@ -370,15 +394,15 @@ class EnqueteData:
         self.tags_global = []  # Tous les tags extraits
 
 # ============================================================================
-# FONCTIONS D'ANALYSE IA - BLIP
+# FONCTIONS D'ANALYSE IA - BLIP-2
 # ============================================================================
 
 def generate_caption(image: Image.Image) -> str:
-    """Génère une description textuelle de l'image avec BLIP"""
+    """Génère une description textuelle de l'image avec BLIP-2"""
     load_models()
-    inputs = processor(image, return_tensors="pt").to(device) # transforme l'imahge en tenseurs et retourne un dico et utilise pytorch
-    out = caption_model.generate(**inputs, max_length=100) #attention ici on se limite à 100 tokens 
-    caption = processor.decode(out[0], skip_special_tokens=True)
+    inputs = processor(images=image, return_tensors="pt").to(device, MODEL_DTYPE)
+    out = model.generate(**inputs, max_new_tokens=50)
+    caption = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
     return caption
 
 """ Après coup, cette fonction est sans doute inutile et un peu surfaite"""
@@ -624,7 +648,7 @@ def page_recherche_analyze_if_needed(current_state):
             break
     
     if needs_analysis:
-        gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP... Veuillez patienter.")
+        gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP-2... Veuillez patienter.")
         current_state = analyze_all_images(current_state)
         gr.Info(f"✅ {len(current_state.images)} image(s) analysée(s) avec succès ! Utilisez la barre de recherche ci-dessous.")
     else:
@@ -961,7 +985,7 @@ def page_recherche_search(query: str, current_state):
 # PAGE 3 : CATÉGORISATION - Classification automatique par catégories
 # ============================================================================
 
-# Définition des catégories pour enquêtes de police (EN ANGLAIS pour compatibilité BLIP)
+# Définition des catégories pour enquêtes de police (EN ANGLAIS pour compatibilité BLIP-2)
 CATEGORIES_POLICE = {
     "people": {
         "icon": "👤",
@@ -1043,212 +1067,109 @@ CATEGORIES_POLICE = {
 }
 
 def ask_vqa_question(image: Image.Image, question: str) -> str:
-    """Pose une question VQA à une image"""
+    """Pose une question ouverte à une image via BLIP-2 (format prompt "Question: ... Answer:")"""
     load_models()
     try:
-        inputs = processor(image, question, return_tensors="pt").to(device)
-        out = vqa_model.generate(**inputs, max_length=50)
-        answer = processor.decode(out[0], skip_special_tokens=True)
+        prompt = f"Question: {question} Answer:"
+        inputs = processor(images=image, text=prompt, return_tensors="pt").to(device, MODEL_DTYPE)
+        out = model.generate(**inputs, max_new_tokens=40)
+        answer = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
+
+        # Le decoder peut renvoyer le prompt en écho avant la réponse : on le retire
+        if answer.lower().startswith(prompt.lower()):
+            answer = answer[len(prompt):].strip()
+        elif "answer:" in answer.lower():
+            answer = answer[answer.lower().rindex("answer:") + len("answer:"):].strip()
+
         return answer.lower().strip()
     except Exception as e:
         print(f"Erreur VQA: {e}")
         return ""
 
+# Questions ouvertes communes posées UNE SEULE FOIS par image (au lieu d'une
+# question fermée par catégorie) : BLIP-2 génère du texte libre, donc on
+# cherche ensuite les mots-clés de chaque catégorie dans les réponses plutôt
+# que d'interpréter des "yes"/"no".
+GENERAL_VQA_QUESTIONS = [
+    "What objects are visible in this image?",
+    "Where was this photo taken?",
+    "What is happening in this image?",
+]
+
 def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     """
-    Classifie une image dans une ou plusieurs catégories de manière interprétative
-    AMÉLIORÉ : Utilise PLUSIEURS questions VQA détaillées par catégorie
+    Classifie une image dans une ou plusieurs catégories de manière interprétative.
+    Pose 3 questions ouvertes communes UNE FOIS par image, puis cherche les
+    mots-clés de chaque catégorie dans la description et les réponses.
     Retourne une liste de catégories (multi-catégories possible)
     """
     image = image_data["image"]
     categories_assigned = []
-    
-    # 1. Obtenir la description de l'image
+
+    # 1. Description + réponses aux questions ouvertes (3 appels VQA au total,
+    # au lieu d'une question fermée par catégorie)
     description = generate_caption(image).lower()
+    vqa_answers = [ask_vqa_question(image, question) for question in GENERAL_VQA_QUESTIONS]
+    combined_text = " ".join([description] + vqa_answers)
+
     print(f"\n=== Analyzing image {image_id} ===")
     print(f"Description: {description}")
-    
-    # 2. Configuration des catégories avec QUESTIONS MULTIPLES détaillées
+    print(f"VQA answers: {vqa_answers}")
+
+    # 2. Configuration des catégories : mots-clés cherchés dans description + réponses
     category_analysis = {
         "people": {
             "keywords": ["person", "man", "woman", "people", "child", "boy", "girl", "human", "face", "crowd", "group"],
-            "vqa_questions": [
-                "Are there any people, persons, or human beings visible in this image?",
-                "Can you see a man, woman, or child in this picture?",
-                "Is there a human face or body visible?"
-            ],
             "weight": 1.0
         },
         "vehicles": {
             "keywords": ["car", "vehicle", "truck", "motorcycle", "bike", "bus", "train", "automobile", "taxi", "van"],
-            "vqa_questions": [
-                "Can you see any vehicles, cars, or means of transportation?",
-                "Is there a car, truck, motorcycle, or bicycle in this image?",
-                "Are there any wheels or vehicle parts visible?"
-            ],
             "weight": 1.0
         },
         "weapons": {
             "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm", "cutting"],
-            "vqa_questions": [
-                "Is there a knife, blade, or sharp cutting tool visible in this image?",
-                "Can you see a gun, firearm, rifle, or pistol?",
-                "What tool or implement is being used or held in this image?",
-                "Are there any weapons, blades, or sharp metallic objects?"
-            ],
-            "weight": 1.2,
-            # Liste d'exclusion STRICTE pour éviter faux positifs
-            "exclude_keywords": ["dog", "cat", "pet", "animal", "bird", "horse"],
-            # Si SEULEMENT ces mots apparaissent (sans knife/gun/blade), alors exclure
-            "exclude_only_if_alone": True
+            "weight": 1.2
         },
         "documents": {
             "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
-            "vqa_questions": [
-                "Is there any text, document, or written content visible?",
-                "Can you see any words, letters, or writing in this image?",
-                "Are there any signs, papers, or documents?"
-            ],
             "weight": 1.0
         },
         "buildings": {
             "keywords": ["building", "house", "structure", "architecture", "wall", "door", "window", "roof", "facade"],
-            "vqa_questions": [
-                "Can you see any buildings, houses, or architectural structures?",
-                "Is there a wall, door, window, or building structure visible?",
-                "Is this image taken in front of or inside a building?"
-            ],
             "weight": 1.0
         },
         "outdoor": {
             "keywords": ["outdoor", "outside", "street", "road", "park", "sky", "nature", "exterior", "sidewalk"],
-            "vqa_questions": [
-                "Is this an outdoor scene or taken outside?",
-                "Can you see the sky, street, or outdoor environment?"
-            ],
             "weight": 0.8
         },
         "indoor": {
             "keywords": ["indoor", "inside", "room", "interior", "ceiling", "floor", "furniture", "wall"],
-            "vqa_questions": [
-                "Is this an indoor scene or taken inside a building?",
-                "Can you see a room, ceiling, or interior space?"
-            ],
             "weight": 0.8
         },
         "objects": {
             "keywords": ["object", "item", "thing", "tool", "equipment", "device", "bag", "box", "bottle", "holding"],
-            "vqa_questions": [
-                "Are there any specific objects, items, or things in this image?",
-                "What objects or items can you see in this picture?"
-            ],
             "weight": 0.7
         },
         "animals": {
             "keywords": ["dog", "cat", "animal", "pet", "bird", "horse"],
-            "vqa_questions": [
-                "Is there a dog, cat, or any animal in this image?",
-                "Can you see a pet or animal?"
-            ],
             "weight": 0.6  # Poids faible, généralement pas prioritaire pour enquêtes
         },
         "advertising": {
             "keywords": ["advertisement", "ad", "brand", "logo", "commercial", "marketing", "poster", "billboard", "sign", "promotion"],
-            "vqa_questions": [
-                "Is this an advertisement, commercial poster, or marketing material?",
-                "Can you see any brand logos, company names, or advertising content?",
-                "Is there any commercial branding or promotional content visible?",
-                "Does this image contain advertising, marketing, or promotional material?"
-            ],
             "weight": 0.5  # Poids faible, généralement pas prioritaire pour enquêtes
         }
     }
-    
-    # 3. Scorer chaque catégorie de manière intelligente avec QUESTIONS MULTIPLES
+
+    # 3. Scorer chaque catégorie selon le nombre de mots-clés trouvés
     category_scores = {}
-    
+
     for category, config in category_analysis.items():
-        score = 0.0
-        
-        # A. Analyse des mots-clés dans la description
-        keyword_matches = sum(1 for keyword in config["keywords"] if keyword in description)
+        keyword_matches = sum(1 for keyword in config["keywords"] if keyword in combined_text)
+        score = (keyword_matches * 25) * config["weight"]
         if keyword_matches > 0:
-            score += (keyword_matches * 20) * config["weight"]
-            print(f"{category}: Found {keyword_matches} keyword(s) in description")
-        
-        # B. Poser TOUTES les questions VQA pour cette catégorie
-        positive_answers = 0
-        total_questions = len(config["vqa_questions"])
-        has_exclusion = False
-        
-        for i, question in enumerate(config["vqa_questions"]):
-            vqa_answer = ask_vqa_question(image, question)
-            print(f"{category} VQA Q{i+1}/{total_questions}: '{vqa_answer}'")
-
-            if vqa_answer:
-                vqa_lower = vqa_answer.lower()
-
-                # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
-                exclude_list = config.get("exclude_keywords", [])
-                if exclude_list:
-                    # Vérifier si des mots d'exclusion sont présents
-                    excluded_found = [e for e in exclude_list if e in vqa_lower]
-
-                    if excluded_found:
-                        # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
-                        weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
-                        has_weapon_word = any(w in vqa_lower for w in weapon_words)
-
-                        # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
-                        if not has_weapon_word and config.get("exclude_only_if_alone", False):
-                            print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
-                            has_exclusion = True
-                            score -= 20  # Pénalité
-                            continue
-                        elif not has_weapon_word:
-                            # Petite pénalité mais pas exclusion totale
-                            score -= 5
-                            print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
-
-                    # Réponses positives claires
-                    if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
-                        positive_answers += 1
-                        score += 25 * config["weight"]
-                        print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
-
-                    # Réponses négatives claires
-                    elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't", "nothing"]):
-                        score -= 5
-                        print(f"  → Q{i+1} Negative (-5)")
-
-                    # Réponses contenant des éléments de la catégorie (détection implicite)
-                    elif any(keyword in vqa_lower for keyword in config["keywords"][:8]):
-                        positive_answers += 0.5
-                        score += 20 * config["weight"]
-                        print(f"  → Q{i+1} Mentions category (+{20 * config['weight']:.1f})")
-
-                    # Réponses descriptives (ex: "knife", "cutting tool")
-                    else:
-                        # Vérifier si la réponse contient des mots pertinents
-                        answer_words = vqa_lower.split()
-                        if any(word in answer_words for word in config["keywords"][:10]):
-                            positive_answers += 0.3
-                            score += 15 * config["weight"]
-                            print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
-
-        # Si exclusion détectée, annuler le score pour cette catégorie
-        if has_exclusion and category == "weapons":
-            score = max(0, score - 30)  # Pénalité supplémentaire pour weapons
-            print(f"  → EXCLUSION penalty applied, score reduced")
-        
-        # Bonus si plusieurs questions confirment la catégorie
-        if positive_answers >= 2:
-            bonus = 20 * config["weight"]
-            score += bonus
-            print(f"  → Multiple confirmations bonus (+{bonus:.1f})")
-        
+            print(f"{category}: {keyword_matches} mot(s)-clé(s) trouvé(s) (score={score:.1f})")
         category_scores[category] = score
-    
+
     # 4. Sélection des catégories avec seuil adaptatif
     # Seuils différents selon la catégorie pour éviter faux positifs
     category_thresholds = {
@@ -1260,27 +1181,27 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         "outdoor": 15,
         "indoor": 15,
         "objects": 25,      # Seuil plus élevé car très générique
-        "animals": 18,      # Seuil normal pour animaux
+        "animals": 15,      # Seuil bas : une seule mention (ex. "dog") doit suffire
         "advertising": 20   # Seuil normal pour publicité
     }
-    
+
     max_categories = 5
-    
+
     # Trier par score
     sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
-    
+
     print(f"\nScores finaux:")
     for cat, score in sorted_categories:
         threshold = category_thresholds.get(cat, 20)
         print(f"  {cat}: {score:.1f} (seuil: {threshold})")
-    
+
     # Assigner les catégories au-dessus de leur seuil spécifique
     for category, score in sorted_categories:
         threshold = category_thresholds.get(category, 20)
         if score >= threshold and len(categories_assigned) < max_categories:
             categories_assigned.append(category)
             print(f"  ✓ Assigned to {category} (score: {score:.1f}, threshold: {threshold})")
-    
+
     # 5. Gérer les conflits indoor/outdoor
     if "indoor" in categories_assigned and "outdoor" in categories_assigned:
         if category_scores["indoor"] > category_scores["outdoor"]:
@@ -1289,12 +1210,12 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         else:
             categories_assigned.remove("indoor")
             print("  → Removed 'indoor' (conflict with outdoor)")
-    
+
     # 6. Si aucune catégorie significative
     if not categories_assigned:
         categories_assigned.append("unclassified")
         print("  ✗ No significant category found, marked as unclassified")
-    
+
     print(f"Final categories: {categories_assigned}\n")
     return categories_assigned
 
@@ -1589,12 +1510,12 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
     description = analysis.get("description", "").lower()
     categories = analysis.get("categories", [])
     tags = analysis.get("tags", [])
-    
+
     print(f"\n=== Scoring image: {analysis.get('filename', 'unknown')} ===")
     print(f"Description: {description}")
     print(f"Categories: {categories}")
     print(f"Tags: {tags}")
-    
+
     # Score de base selon catégories (TOUJOURS APPLICABLE)
     base_score = 0
     critical_categories = {
@@ -1607,20 +1528,20 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
         "outdoor": 15,     # Extérieur = moyennement pertinent
         "objects": 12      # Objets = pertinent
     }
-    
+
     for cat, points in critical_categories.items():
         if cat in categories:
             base_score += points
             print(f"  Category '{cat}': +{points} points")
-    
+
     score += base_score
-    
+
     # Bonus catégories multiples (image riche)
     if len(categories) >= 3:
         bonus = 15
         score += bonus
         print(f"  Multiple categories bonus: +{bonus} points")
-    
+
     # Tags importants
     tag_score = 0
     important_tags = ["people", "vehicles", "documents", "weapons", "buildings"]
@@ -1630,7 +1551,7 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
     if tag_score > 0:
         score += tag_score
         print(f"  Important tags: +{tag_score} points")
-    
+
     # Description détaillée
     word_count = len(description.split())
     if word_count > 10:
@@ -1639,27 +1560,27 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
     elif word_count > 6:
         score += 6
         print(f"  Medium description: +6 points")
-    
+
     # SI CONTEXTE FOURNI : Analyse sémantique approfondie
     if contexte_enquete and len(contexte_enquete.strip()) > 10:
         contexte_lower = contexte_enquete.lower()
-        
+
         # Nettoyer et extraire mots significatifs du contexte
         stop_words = {"le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "avec", "pour", "par"}
         contexte_words = [w for w in contexte_lower.split() if len(w) > 3 and w not in stop_words]
-        
+
         print(f"  Context words to match: {contexte_words[:20]}")
-        
+
         # 1. Correspondance exacte des mots-clés (POIDS TRÈS FORT)
         exact_matches = 0
         for word in contexte_words[:20]:  # Top 20 mots du contexte
             if word in description:
                 exact_matches += 1
                 score += 12  # +12 points par correspondance exacte
-        
+
         if exact_matches > 0:
             print(f"  Exact word matches: {exact_matches} words → +{exact_matches * 12} points")
-        
+
         # 2. Correspondance partielle (mots racines, préfixes)
         partial_matches = 0
         for word in contexte_words[:20]:
@@ -1672,10 +1593,10 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
                             partial_matches += 1
                             score += 6  # +6 points par correspondance partielle
                             break
-        
+
         if partial_matches > 0:
             print(f"  Partial matches: {partial_matches} → +{partial_matches * 6} points")
-        
+
         # 3. Correspondance sémantique via catégories mentionnées dans contexte
         semantic_bonus = 0
         category_keywords = {
@@ -1687,7 +1608,7 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
             "outdoor": ["extérieur", "dehors", "rue", "route", "parc"],
             "indoor": ["intérieur", "dedans", "pièce", "salle", "chambre"]
         }
-        
+
         for cat, keywords in category_keywords.items():
             if cat in categories:
                 for keyword in keywords:
@@ -1695,9 +1616,9 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
                         semantic_bonus += 15
                         print(f"  Semantic match '{cat}' via '{keyword}': +15 points")
                         break
-        
+
         score += semantic_bonus
-        
+
         # 4. Bonus si beaucoup de correspondances (contexte très pertinent)
         if exact_matches >= 3:
             high_relevance_bonus = 20
@@ -1708,11 +1629,11 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
             print(f"  Medium relevance bonus: +10 points")
     else:
         print("  No context provided, using base scoring only")
-    
+
     # Normaliser entre 0 et 100
     final_score = min(100, max(0, score))
     print(f"  FINAL SCORE: {final_score}/100\n")
-    
+
     return final_score
 
 def classify_by_investigation_relevance(score: int) -> str:
@@ -1748,23 +1669,23 @@ def page_analyse_sort_all(current_state):
     # Calculer le score de pertinence pour chaque image
     contexte = current_state.enquete_info.get("contexte", "")
     relevance_counts = {"pertinent": 0, "a_traiter": 0, "non_pertinent": 0}
-    
+
     for idx, analysis in current_state.analyses.items():
         # Calculer le score de pertinence
         relevance_score = calculate_investigation_relevance_score(analysis, contexte)
         relevance_category = classify_by_investigation_relevance(relevance_score)
-        
+
         # Stocker dans l'analyse
         analysis["relevance_score"] = relevance_score
         analysis["relevance_category"] = relevance_category
-        
+
         relevance_counts[relevance_category] += 1
-        
+
         print(f"Image {idx}: score={relevance_score}, category={relevance_category}")
-    
+
     # Notification de succès
     gr.Info(f"✅ {len(current_state.images)} image(s) triée(s) par pertinence ! 🟢 Pertinentes: {relevance_counts['pertinent']} | 🟡 À traiter: {relevance_counts['a_traiter']} | 🔴 Non pertinentes: {relevance_counts['non_pertinent']}")
-    
+
     return "", current_state, relevance_counts
 
 def page_analyse_filter_by_relevance(relevance_category: str, current_state):
@@ -2238,7 +2159,7 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
               - 🟢 **Pertinentes** (score ≥ 55) : Images hautement pertinentes
               - 🟡 **À traiter** (25-54) : Images nécessitant une analyse approfondie
               - 🔴 **Non pertinentes** (< 25) : Images probablement sans intérêt
-            
+
             Cliquez sur "Trier les images" puis sur une catégorie pour voir les images correspondantes.
             """)
             
@@ -2364,8 +2285,8 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
     - Pour un usage en production, déployez cette application en local
     
     ### 🧠 Technologies
-    - **Intelligence Artificielle** : 
-      - BLIP (Captioning + VQA) pour images
+    - **Intelligence Artificielle** :
+      - BLIP-2 (Captioning + VQA, quantization 4-bit) pour images
     - **Interface** : Gradio Multi-pages
     - **Version** : 2.5 - Analyse d'Images
     """)
