@@ -1,5 +1,6 @@
 import gradio as gr
 from transformers import Blip2Processor, Blip2ForConditionalGeneration, BitsAndBytesConfig
+from sentence_transformers import SentenceTransformer, util
 from PIL import Image
 import torch
 from typing import List, Dict, Tuple, Optional
@@ -1501,148 +1502,96 @@ def page_categorisation_filter(category_id: str, current_state):
 # PAGE 5 : ANALYSE - Espace de travail avec tri pertinence enquête
 # ============================================================================
 
+# Modèle de similarité sémantique pour le score de contexte (léger, tourne sur
+# CPU sans impact sur la VRAM réservée à BLIP-2). Chargé une seule fois (lazy).
+_semantic_model = None
+# L'embedding du contexte d'enquête est identique pour toutes les images d'une
+# même enquête : on le calcule une fois et on le réutilise (invalidé si le
+# texte du contexte change).
+_context_embedding_cache = {"text": None, "embedding": None}
+
+def _get_semantic_model():
+    global _semantic_model
+    if _semantic_model is None:
+        print(" Chargement du modèle de similarité sémantique (all-MiniLM-L6-v2, CPU)...")
+        _semantic_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    return _semantic_model
+
+def _get_context_embedding(contexte_enquete: str):
+    """Encode le contexte d'enquête, avec cache (identique pour toutes les images)"""
+    if _context_embedding_cache["text"] != contexte_enquete:
+        _context_embedding_cache["embedding"] = _get_semantic_model().encode(contexte_enquete, convert_to_tensor=True)
+        _context_embedding_cache["text"] = contexte_enquete
+    return _context_embedding_cache["embedding"]
+
+CONTENT_SCORE_MAX = 40
+CONTEXT_SCORE_MAX = 60
+
 def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: str) -> int:
     """
-    Calcule un score de pertinence spécifique pour l'enquête (0-100)
-    Système amélioré avec correspondance sémantique flexible
+    Calcule le score de pertinence d'une image pour l'enquête (0-100).
+
+    Le score est la somme de deux composantes qui ne peuvent pas se compenser :
+    - CONTENU (0-40) : ce que l'image contient objectivement (catégories
+      détectées, richesse de la description), indépendant de tout contexte.
+    - CONTEXTE (0-60) : similarité sémantique (cosinus d'embeddings
+      sentence-transformers) entre la description de l'image et le contexte
+      d'enquête fourni par l'utilisateur, plutôt qu'un matching de mots.
+
+    Le plafond du contenu (40) est volontairement inférieur au seuil "pertinent"
+    (55, voir classify_by_investigation_relevance) : une image ne peut donc
+    jamais être classée pertinente sur son seul contenu, même avec de
+    nombreuses catégories détectées. C'est le correctif à l'ancien système où
+    le score de contenu seul saturait déjà à 100 et rendait le contexte
+    décoratif. Sans contexte fourni, le score de contexte vaut 0.
     """
-    score = 0
     description = analysis.get("description", "").lower()
     categories = analysis.get("categories", [])
-    tags = analysis.get("tags", [])
 
-    print(f"\n=== Scoring image: {analysis.get('filename', 'unknown')} ===")
-    print(f"Description: {description}")
-    print(f"Categories: {categories}")
-    print(f"Tags: {tags}")
-
-    # Score de base selon catégories (TOUJOURS APPLICABLE)
-    base_score = 0
-    critical_categories = {
-        "people": 25,      # Personnes = très pertinent
-        "weapons": 45,     # Armes = extrêmement pertinent
-        "vehicles": 22,    # Véhicules = pertinent
-        "documents": 28,   # Documents = très pertinent
-        "buildings": 18,   # Lieux = pertinent
-        "indoor": 15,      # Intérieur = moyennement pertinent
-        "outdoor": 15,     # Extérieur = moyennement pertinent
-        "objects": 12      # Objets = pertinent
+    # --- Score de CONTENU (0-40) ---
+    category_points = {
+        "weapons": 15, "documents": 9, "people": 8, "vehicles": 7,
+        "buildings": 6, "indoor": 5, "outdoor": 5, "objects": 4,
+        "animals": 3, "advertising": 3,
     }
+    content_score = sum(category_points.get(cat, 0) for cat in categories)
 
-    for cat, points in critical_categories.items():
-        if cat in categories:
-            base_score += points
-            print(f"  Category '{cat}': +{points} points")
-
-    score += base_score
-
-    # Bonus catégories multiples (image riche)
-    if len(categories) >= 3:
-        bonus = 15
-        score += bonus
-        print(f"  Multiple categories bonus: +{bonus} points")
-
-    # Tags importants
-    tag_score = 0
-    important_tags = ["people", "vehicles", "documents", "weapons", "buildings"]
-    for tag in tags:
-        if tag in important_tags:
-            tag_score += 8
-    if tag_score > 0:
-        score += tag_score
-        print(f"  Important tags: +{tag_score} points")
-
-    # Description détaillée
     word_count = len(description.split())
     if word_count > 10:
-        score += 12
-        print(f"  Detailed description: +12 points")
+        content_score += 8
     elif word_count > 6:
-        score += 6
-        print(f"  Medium description: +6 points")
+        content_score += 4
 
-    # SI CONTEXTE FOURNI : Analyse sémantique approfondie
-    if contexte_enquete and len(contexte_enquete.strip()) > 10:
-        contexte_lower = contexte_enquete.lower()
+    content_score = min(CONTENT_SCORE_MAX, content_score)
 
-        # Nettoyer et extraire mots significatifs du contexte
-        stop_words = {"le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "avec", "pour", "par"}
-        contexte_words = [w for w in contexte_lower.split() if len(w) > 3 and w not in stop_words]
+    # --- Score de CONTEXTE (0-60) ---
+    has_context = bool(contexte_enquete and contexte_enquete.strip())
+    context_score = 0.0
+    if has_context and description:
+        description_embedding = _get_semantic_model().encode(description, convert_to_tensor=True)
+        context_embedding = _get_context_embedding(contexte_enquete)
+        cosine = util.cos_sim(description_embedding, context_embedding).item()
+        context_score = max(0.0, min(1.0, cosine)) * CONTEXT_SCORE_MAX
 
-        print(f"  Context words to match: {contexte_words[:20]}")
+    final_score = round(content_score + context_score)
 
-        # 1. Correspondance exacte des mots-clés (POIDS TRÈS FORT)
-        exact_matches = 0
-        for word in contexte_words[:20]:  # Top 20 mots du contexte
-            if word in description:
-                exact_matches += 1
-                score += 12  # +12 points par correspondance exacte
+    print(
+        f"Scoring '{analysis.get('filename', 'unknown')}': "
+        f"contenu={content_score:.1f}/{CONTENT_SCORE_MAX}, "
+        f"contexte={context_score:.1f}/{CONTEXT_SCORE_MAX} (fourni={has_context}), "
+        f"total={final_score}/100"
+    )
 
-        if exact_matches > 0:
-            print(f"  Exact word matches: {exact_matches} words → +{exact_matches * 12} points")
-
-        # 2. Correspondance partielle (mots racines, préfixes)
-        partial_matches = 0
-        for word in contexte_words[:20]:
-            # Vérifier les correspondances partielles (au moins 4 caractères communs)
-            if len(word) >= 4:
-                for desc_word in description.split():
-                    if len(desc_word) >= 4:
-                        # Correspondance de début de mot (préfixe commun)
-                        if word[:4] in desc_word or desc_word[:4] in word:
-                            partial_matches += 1
-                            score += 6  # +6 points par correspondance partielle
-                            break
-
-        if partial_matches > 0:
-            print(f"  Partial matches: {partial_matches} → +{partial_matches * 6} points")
-
-        # 3. Correspondance sémantique via catégories mentionnées dans contexte
-        semantic_bonus = 0
-        category_keywords = {
-            "people": ["personne", "homme", "femme", "suspect", "témoin", "individu", "gens"],
-            "vehicles": ["voiture", "véhicule", "auto", "moto", "camion", "transport"],
-            "weapons": ["arme", "pistolet", "couteau", "fusil", "dangereux"],
-            "documents": ["document", "papier", "texte", "écrit", "lettre", "note"],
-            "buildings": ["bâtiment", "maison", "immeuble", "structure", "lieu"],
-            "outdoor": ["extérieur", "dehors", "rue", "route", "parc"],
-            "indoor": ["intérieur", "dedans", "pièce", "salle", "chambre"]
-        }
-
-        for cat, keywords in category_keywords.items():
-            if cat in categories:
-                for keyword in keywords:
-                    if keyword in contexte_lower:
-                        semantic_bonus += 15
-                        print(f"  Semantic match '{cat}' via '{keyword}': +15 points")
-                        break
-
-        score += semantic_bonus
-
-        # 4. Bonus si beaucoup de correspondances (contexte très pertinent)
-        if exact_matches >= 3:
-            high_relevance_bonus = 20
-            score += high_relevance_bonus
-            print(f"  High relevance bonus: +{high_relevance_bonus} points")
-        elif exact_matches >= 2:
-            score += 10
-            print(f"  Medium relevance bonus: +10 points")
-    else:
-        print("  No context provided, using base scoring only")
-
-    # Normaliser entre 0 et 100
-    final_score = min(100, max(0, score))
-    print(f"  FINAL SCORE: {final_score}/100\n")
-
-    return final_score
+    return max(0, min(100, final_score))
 
 def classify_by_investigation_relevance(score: int) -> str:
     """
-    Classifie une image selon son score de pertinence
-    Seuils ajustés pour le nouveau système de scoring :
-    Pertinent: score >= 55
-    À traiter: 25 <= score < 55
-    Non pertinent: score < 25
+    Classifie une image selon son score de pertinence (0-100).
+    Seuils choisis pour l'échelle contenu(0-40) + contexte(0-60) :
+    - Pertinent (score >= 55) : dépasse le contenu maximal seul (40), donc
+      exige une similarité de contexte significative, pas juste du contenu.
+    - À traiter (25 <= score < 55)
+    - Non pertinent (score < 25)
     """
     if score >= 55:
         return "pertinent"
@@ -1668,6 +1617,7 @@ def page_analyse_sort_all(current_state):
     
     # Calculer le score de pertinence pour chaque image
     contexte = current_state.enquete_info.get("contexte", "")
+    has_context = bool(contexte and contexte.strip())
     relevance_counts = {"pertinent": 0, "a_traiter": 0, "non_pertinent": 0}
 
     for idx, analysis in current_state.analyses.items():
@@ -1686,7 +1636,17 @@ def page_analyse_sort_all(current_state):
     # Notification de succès
     gr.Info(f"✅ {len(current_state.images)} image(s) triée(s) par pertinence ! 🟢 Pertinentes: {relevance_counts['pertinent']} | 🟡 À traiter: {relevance_counts['a_traiter']} | 🔴 Non pertinentes: {relevance_counts['non_pertinent']}")
 
-    return "", current_state, relevance_counts
+    # Sans contexte, le score ne reflète que le contenu de l'image (plafonné à
+    # 40/100) : on le dit explicitement plutôt que de laisser un score muet.
+    status_html = ""
+    if not has_context:
+        status_html = """
+        <div class="info-message" style="border-color: #dc3545; color: #dc3545;">
+            ⚠️ Aucun contexte d'enquête défini : le score de pertinence ne reflète que le <strong>contenu</strong> de l'image (catégories, description), plafonné à 40/100, pas sa pertinence pour une enquête précise. Définissez un contexte dans l'onglet <strong>Accueil</strong> pour un tri fiable.
+        </div>
+        """
+
+    return status_html, current_state, relevance_counts
 
 def page_analyse_filter_by_relevance(relevance_category: str, current_state):
     """
@@ -2153,12 +2113,14 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             Cette page vous permet de trier toutes les images selon leur **pertinence pour l'enquête** en fonction du contexte que vous avez défini.
             
             ### 🎯 Système de scoring de pertinence :
-            - **Score basé sur le contexte** de l'enquête (correspondance sémantique avancée)
-            - **Analyse multi-critères** : catégories, description, correspondances exactes et partielles
+            - **Score de contenu** (0-40) : catégories détectées, richesse de la description — indépendant du contexte
+            - **Score de contexte** (0-60) : similarité sémantique (embeddings) entre la description et le contexte de l'enquête, pas un simple mot-clé
             - **3 niveaux de pertinence** :
-              - 🟢 **Pertinentes** (score ≥ 55) : Images hautement pertinentes
+              - 🟢 **Pertinentes** (score ≥ 55) : nécessite une similarité de contexte significative, le contenu seul ne suffit jamais
               - 🟡 **À traiter** (25-54) : Images nécessitant une analyse approfondie
               - 🔴 **Non pertinentes** (< 25) : Images probablement sans intérêt
+
+            ⚠️ Sans contexte d'enquête défini (onglet Accueil), le score plafonne à 40/100 (contenu seul).
 
             Cliquez sur "Trier les images" puis sur une catégorie pour voir les images correspondantes.
             """)
