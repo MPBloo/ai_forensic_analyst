@@ -1184,58 +1184,58 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         for i, question in enumerate(config["vqa_questions"]):
             vqa_answer = ask_vqa_question(image, question)
             print(f"{category} VQA Q{i+1}/{total_questions}: '{vqa_answer}'")
-            
-        if vqa_answer:
-            vqa_lower = vqa_answer.lower()
-            
-            # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
-            exclude_list = config.get("exclude_keywords", [])
-            if exclude_list:
-                # Vérifier si des mots d'exclusion sont présents
-                excluded_found = [e for e in exclude_list if e in vqa_lower]
-                
-                if excluded_found:
-                    # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
-                    weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
-                    has_weapon_word = any(w in vqa_lower for w in weapon_words)
-                    
-                    # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
-                    if not has_weapon_word and config.get("exclude_only_if_alone", False):
-                        print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
-                        has_exclusion = True
-                        score -= 20  # Pénalité
-                        continue
-                    elif not has_weapon_word:
-                        # Petite pénalité mais pas exclusion totale
+
+            if vqa_answer:
+                vqa_lower = vqa_answer.lower()
+
+                # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
+                exclude_list = config.get("exclude_keywords", [])
+                if exclude_list:
+                    # Vérifier si des mots d'exclusion sont présents
+                    excluded_found = [e for e in exclude_list if e in vqa_lower]
+
+                    if excluded_found:
+                        # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
+                        weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
+                        has_weapon_word = any(w in vqa_lower for w in weapon_words)
+
+                        # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
+                        if not has_weapon_word and config.get("exclude_only_if_alone", False):
+                            print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
+                            has_exclusion = True
+                            score -= 20  # Pénalité
+                            continue
+                        elif not has_weapon_word:
+                            # Petite pénalité mais pas exclusion totale
+                            score -= 5
+                            print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
+
+                    # Réponses positives claires
+                    if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
+                        positive_answers += 1
+                        score += 25 * config["weight"]
+                        print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
+
+                    # Réponses négatives claires
+                    elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't", "nothing"]):
                         score -= 5
-                        print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
-                
-                # Réponses positives claires
-                if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
-                    positive_answers += 1
-                score += 25 * config["weight"]
-                    print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
-                
-                # Réponses négatives claires
-                elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't", "nothing"]):
-                    score -= 5
-                    print(f"  → Q{i+1} Negative (-5)")
-                
-                # Réponses contenant des éléments de la catégorie (détection implicite)
-                elif any(keyword in vqa_lower for keyword in config["keywords"][:8]):
-                    positive_answers += 0.5
-                    score += 20 * config["weight"]
-                    print(f"  → Q{i+1} Mentions category (+{20 * config['weight']:.1f})")
-                
-                # Réponses descriptives (ex: "knife", "cutting tool")
-                else:
-                    # Vérifier si la réponse contient des mots pertinents
-                    answer_words = vqa_lower.split()
-                    if any(word in answer_words for word in config["keywords"][:10]):
-                        positive_answers += 0.3
-                        score += 15 * config["weight"]
-                        print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
-        
+                        print(f"  → Q{i+1} Negative (-5)")
+
+                    # Réponses contenant des éléments de la catégorie (détection implicite)
+                    elif any(keyword in vqa_lower for keyword in config["keywords"][:8]):
+                        positive_answers += 0.5
+                        score += 20 * config["weight"]
+                        print(f"  → Q{i+1} Mentions category (+{20 * config['weight']:.1f})")
+
+                    # Réponses descriptives (ex: "knife", "cutting tool")
+                    else:
+                        # Vérifier si la réponse contient des mots pertinents
+                        answer_words = vqa_lower.split()
+                        if any(word in answer_words for word in config["keywords"][:10]):
+                            positive_answers += 0.3
+                            score += 15 * config["weight"]
+                            print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
+
         # Si exclusion détectée, annuler le score pour cette catégorie
         if has_exclusion and category == "weapons":
             score = max(0, score - 30)  # Pénalité supplémentaire pour weapons
@@ -1332,32 +1332,30 @@ def page_categorisation_analyze(current_state):
     gr.Info(f"✅ {len(current_state.images)} image(s) catégorisée(s) avec succès ! Cliquez sur une catégorie à gauche.")
     
     # Générer le HTML des statistiques cliquables
-    stats_html = generate_clickable_categories_stats(categories_count)
+    stats_html = generate_clickable_categories_stats(categories_count, len(current_state.images))
     
     # Retourner avec changement d'état : masquer boutons, afficher stats
     return "", current_state, stats_html, categories_count, gr.Group(visible=False), gr.Group(visible=True)
 
-def generate_clickable_categories_stats(categories_count: dict) -> str:
+def generate_clickable_categories_stats(categories_count: dict, total_images: int) -> str:
     """
     Génère le HTML des statistiques avec instructions pour les boutons Gradio
     """
     html = """
     <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px; border: 2px solid var(--border-gray);">
     """
-    
-    total_images = sum(categories_count.values())
-    
+
     for cat_id, cat_info in CATEGORIES_POLICE.items():
         count = categories_count.get(cat_id, 0)
         label_display = cat_info.get('label_fr', cat_info['label'])
-        
+
         if count > 0:  # Afficher seulement les catégories avec des images
             percentage = (count / total_images * 100) if total_images > 0 else 0
-        
-        html += f"""
-            <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
+
+            html += f"""
+            <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;"
                  onclick="triggerGradioButton('{cat_id}')"
-                 onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
+                 onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'"
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <div>
@@ -1376,7 +1374,7 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
             </p>
         </div>
         """
-    
+
     # Bouton "Toutes les images"
     html += f"""
         <div style="margin: 15px 0; padding: 15px; background: var(--light-blue); border-radius: 8px; cursor: pointer; text-align: center; transition: all 0.3s ease;" 
