@@ -8,6 +8,10 @@ import pandas as pd
 from datetime import datetime
 import json
 import base64
+import os
+import sqlite3
+import hashlib
+import time
 from io import BytesIO
 
 # Configuration du device
@@ -53,7 +57,86 @@ def load_models():
 
     print(f"{MODEL_NAME} chargé avec succès !")
 
-# CSS personnalisé 
+# ============================================================================
+# PERSISTANCE SQLITE - Reprise après interruption sur de gros lots d'images
+# ============================================================================
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iargos_analysis.db")
+
+def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+    """Ouvre une connexion SQLite et crée la table images si nécessaire"""
+    conn = sqlite3.connect(db_path or DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS images (
+            path TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            description TEXT,
+            categories TEXT,
+            relevance_score INTEGER,
+            analyzed_at TEXT
+        )
+    """)
+    return conn
+
+def compute_sha256(path: str) -> str:
+    """Hash le contenu d'un fichier par blocs (pas de chargement complet en mémoire)"""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def get_analyzed_paths(db_path: Optional[str] = None) -> set:
+    """Chemins déjà analysés et présents en base (pour sauter les images déjà traitées)"""
+    conn = get_db_connection(db_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT path FROM images")}
+    finally:
+        conn.close()
+
+def load_image_analysis(path: str, db_path: Optional[str] = None) -> Optional[dict]:
+    """Recharge le résultat d'analyse d'une image déjà en base"""
+    conn = get_db_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT path, filename, description, categories FROM images WHERE path = ?",
+            (path,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "path": row[0],
+        "filename": row[1],
+        "description": row[2] or "",
+        "categories": json.loads(row[3]) if row[3] else [],
+    }
+
+def save_image_analysis(record: dict, db_path: Optional[str] = None) -> None:
+    """Sauvegarde (ou met à jour) le résultat d'analyse d'une image"""
+    conn = get_db_connection(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO images (path, filename, sha256, description, categories, relevance_score, analyzed_at)
+            VALUES (:path, :filename, :sha256, :description, :categories, :relevance_score, :analyzed_at)
+            ON CONFLICT(path) DO UPDATE SET
+                filename=excluded.filename,
+                sha256=excluded.sha256,
+                description=excluded.description,
+                categories=excluded.categories,
+                relevance_score=excluded.relevance_score,
+                analyzed_at=excluded.analyzed_at
+            """,
+            record,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# CSS personnalisé
 CUSTOM_CSS = """
 /* Palette de couleurs police française */
 :root {
@@ -399,12 +482,15 @@ class EnqueteData:
 # ============================================================================
 
 def generate_caption(image: Image.Image) -> str:
-    """Génère une description textuelle de l'image avec BLIP-2"""
+    """Génère une description textuelle d'une image avec BLIP-2"""
+    return generate_captions_batch([image])[0]
+
+def generate_captions_batch(images: List[Image.Image]) -> List[str]:
+    """Génère les descriptions d'un lot d'images en un seul passage BLIP-2"""
     load_models()
-    inputs = processor(images=image, return_tensors="pt").to(device, MODEL_DTYPE)
+    inputs = processor(images=images, return_tensors="pt").to(device, MODEL_DTYPE)
     out = model.generate(**inputs, max_new_tokens=50)
-    caption = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
-    return caption
+    return [caption.strip() for caption in processor.batch_decode(out, skip_special_tokens=True)]
 
 """ Après coup, cette fonction est sans doute inutile et un peu surfaite"""
 
@@ -474,54 +560,130 @@ def calculate_relevance_score(description: str, tags: List[str], contexte_enquet
 
 
 
-def analyze_image_complete(image_data: dict, contexte_enquete: str, image_id: int) -> dict:
+def analyze_all_images(state: EnqueteData, batch_size: int = 4, progress: Optional[gr.Progress] = None) -> EnqueteData:
     """
-    Analyse complète d'une image : description, tags, score
-    """
-    try:
-        description = generate_caption(image_data["image"])
-        tags = extract_tags_from_description(description)
-        score = calculate_relevance_score(description, tags, contexte_enquete)
-        
-        return {
-            "id": image_id,
-            "filename": image_data["filename"],
-            "image": image_data["image"],
-            "description": description,
-            "tags": tags,
-            "score": score,
-            "analyzed": True
-        }
-    except Exception as e:
-        print(f"Erreur lors de l'analyse de {image_data.get('filename', 'image')}: {e}")
-        return {
-            "id": image_id,
-            "filename": image_data.get("filename", "unknown"),
-            "image": image_data.get("image"),
-            "description": "Erreur d'analyse",
-            "tags": [],
-            "score": 0,
-            "analyzed": False
-        }
+    Analyse (description + tags + score + catégories) les images pas encore
+    analysées, par lots de `batch_size` images (réduit automatiquement de
+    moitié en cas d'OOM GPU, jusqu'à 1). Ne garde en RAM que le lot courant :
+    les images sont ouvertes depuis leur chemin sur disque juste avant
+    traitement, jamais chargées toutes d'un coup (contrainte : ~2000 images
+    sur un GPU à ~4 Go de VRAM).
 
-def analyze_all_images(state: EnqueteData, progress_callback=None) -> EnqueteData:
-    """Analyse toutes les images de l'enquête"""
+    Les résultats sont persistés en SQLite au fur et à mesure (voir
+    save_image_analysis) : une interruption (crash, Ctrl+C) ne fait perdre
+    que le lot en cours, pas le travail déjà fait — les images déjà en base
+    sont sautées au relancement.
+    """
     contexte = state.enquete_info.get("contexte", "")
-    
-    for idx, img_data in enumerate(state.images):
-        # Vérifier si l'image a déjà été analysée
-        if idx not in state.analyses or not state.analyses[idx].get("analyzed", False):
-            analysis = analyze_image_complete(img_data, contexte, idx)
-            state.analyses[idx] = analysis
-            
-            # Ajouter les tags au pool global
-            for tag in analysis["tags"]:
-                if tag not in state.tags_global:
-                    state.tags_global.append(tag)
-            
-            if progress_callback:
-                progress_callback(f"Analyse {idx + 1}/{len(state.images)}...")
-    
+    analyzed_paths_in_db = get_analyzed_paths()
+
+    to_process = [
+        (idx, img_data) for idx, img_data in enumerate(state.images)
+        if idx not in state.analyses or not state.analyses[idx].get("analyzed", False)
+    ]
+    total = len(to_process)
+    if total == 0:
+        return state
+
+    current_batch_size = max(1, batch_size)
+    processed = 0
+    start_time = time.time()
+    i = 0
+
+    while i < len(to_process):
+        batch = to_process[i:i + current_batch_size]
+
+        images = []
+        valid_entries = []  # (idx, img_data) pour les images réellement passées à BLIP-2
+        for idx, img_data in batch:
+            path = img_data["path"]
+
+            # Reprise après interruption : déjà en base, pas besoin de repasser BLIP-2 dessus
+            if path in analyzed_paths_in_db:
+                cached = load_image_analysis(path)
+                if cached:
+                    description = cached["description"]
+                    tags = extract_tags_from_description(description)
+                    state.analyses[idx] = {
+                        "id": idx, "filename": img_data["filename"], "path": path,
+                        "description": description, "tags": tags,
+                        "categories": cached["categories"],
+                        "score": calculate_relevance_score(description, tags, contexte),
+                        "analyzed": True,
+                    }
+                    for tag in tags:
+                        if tag not in state.tags_global:
+                            state.tags_global.append(tag)
+                    processed += 1
+                    continue
+
+            try:
+                with Image.open(path) as raw:
+                    images.append(raw.convert("RGB"))
+                valid_entries.append((idx, img_data))
+            except Exception as e:
+                print(f"Erreur lors de l'analyse de {img_data.get('filename', 'image')}: {e}")
+                state.analyses[idx] = {
+                    "id": idx, "filename": img_data.get("filename", "unknown"), "path": path,
+                    "description": "Erreur d'analyse", "tags": [], "categories": [], "score": 0,
+                    "analyzed": False,
+                }
+                processed += 1
+
+        if images:
+            try:
+                captions = generate_captions_batch(images)
+                answers_per_question = [ask_vqa_questions_batch(images, q) for q in GENERAL_VQA_QUESTIONS]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                for img in images:
+                    img.close()
+                if current_batch_size > 1:
+                    current_batch_size = max(1, current_batch_size // 2)
+                    print(f"⚠️ OOM GPU détecté, réduction du batch à {current_batch_size} image(s)")
+                    continue  # on ne fait pas avancer i : on réessaie ce même lot, plus petit
+                raise
+
+            for pos, (idx, img_data) in enumerate(valid_entries):
+                description = captions[pos]
+                vqa_answers = [answers_per_question[q_idx][pos] for q_idx in range(len(GENERAL_VQA_QUESTIONS))]
+                categories = categories_from_text(description, vqa_answers)
+                tags = extract_tags_from_description(description)
+                score = calculate_relevance_score(description, tags, contexte)
+                path = img_data["path"]
+
+                state.analyses[idx] = {
+                    "id": idx, "filename": img_data["filename"], "path": path,
+                    "description": description, "tags": tags, "categories": categories,
+                    "score": score, "analyzed": True,
+                }
+                for tag in tags:
+                    if tag not in state.tags_global:
+                        state.tags_global.append(tag)
+
+                try:
+                    save_image_analysis({
+                        "path": path, "filename": img_data["filename"],
+                        "sha256": compute_sha256(path), "description": description,
+                        "categories": json.dumps(categories), "relevance_score": score,
+                        "analyzed_at": datetime.now().isoformat(),
+                    })
+                except Exception as e:
+                    print(f"Erreur persistance SQLite pour {path}: {e}")
+
+                processed += 1
+
+            for img in images:
+                img.close()
+
+        elapsed_minutes = max((time.time() - start_time) / 60, 1e-9)
+        throughput = processed / elapsed_minutes
+        print(f"Débit: {throughput:.1f} images/minute ({processed}/{total})")
+        if progress is not None:
+            progress(processed / total, desc=f"{processed}/{total} images analysées ({throughput:.1f} img/min)")
+
+        i += len(batch)
+
     return state
 
 # ============================================================================
@@ -542,19 +704,21 @@ def page_accueil_init_images(files, current_state):
     else:
         state = current_state
     
-    # Charger les images
+    # Enregistrer uniquement les chemins (pas de chargement PIL à l'upload :
+    # avec ~2000 images, les garder toutes ouvertes en RAM n'est pas tenable).
+    # La validité de chaque fichier est vérifiée plus tard, image par image,
+    # au moment de l'analyse par lots (analyze_all_images).
     new_images = []
     for file_path in files:
-        try:
-            img = Image.open(file_path).convert('RGB')
-            new_images.append({
-                "image": img,
-                "filename": file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1],
-                "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-        except Exception as e:
-            print(f"Erreur lors du chargement de {file_path}: {e}")
-    
+        if not os.path.isfile(file_path):
+            print(f"Fichier introuvable: {file_path}")
+            continue
+        new_images.append({
+            "path": file_path,
+            "filename": file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1],
+            "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
     state.images.extend(new_images)
     state.enquete_info["nombre_images"] = len(state.images)
     
@@ -608,31 +772,31 @@ def generate_stats_html(state: EnqueteData) -> str:
 # UTILITAIRES - Conversion images
 # ============================================================================
 
-def pil_to_base64(image: Image.Image, max_size=(400, 400)) -> str:
+def pil_to_base64_from_path(path: str, max_size=(400, 400)) -> str:
     """
-    Convertit une image PIL en base64 pour affichage HTML
-    Redimensionne l'image pour optimiser les performances
+    Génère une vignette base64 à la volée depuis un fichier sur disque, pour
+    affichage HTML. Aucune image PIL n'est conservée en mémoire dans
+    EnqueteData : on ouvre, on redimensionne, on encode, on referme.
     """
     try:
-        # Redimensionner l'image pour l'aperçu (économiser bande passante)
-        img_copy = image.copy()
-        img_copy.thumbnail(max_size, Image.Resampling.LANCZOS)
-        
-        # Convertir en base64
-        buffered = BytesIO()
-        img_copy.save(buffered, format="JPEG", quality=85)
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        return f"data:image/jpeg;base64,{img_str}"
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            return f"data:image/jpeg;base64,{img_str}"
     except Exception as e:
-        print(f"Erreur conversion image: {e}")
+        print(f"Erreur conversion image {path}: {e}")
         return ""
 
 # ============================================================================
 # PAGE 2 : RECHERCHE - Recherche textuelle dans les images
 # ============================================================================
 
-def page_recherche_analyze_if_needed(current_state):
+def page_recherche_analyze_if_needed(current_state, progress: gr.Progress = gr.Progress()):
     """Lance l'analyse des images si pas encore fait"""
     if current_state is None or len(current_state.images) == 0:
         return """
@@ -640,21 +804,21 @@ def page_recherche_analyze_if_needed(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state
-    
+
     # Vérifier si toutes les images ont été analysées
     needs_analysis = False
     for idx in range(len(current_state.images)):
         if idx not in current_state.analyses or not current_state.analyses[idx].get("analyzed", False):
             needs_analysis = True
             break
-    
+
     if needs_analysis:
         gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP-2... Veuillez patienter.")
-        current_state = analyze_all_images(current_state)
+        current_state = analyze_all_images(current_state, progress=progress)
         gr.Info(f"✅ {len(current_state.images)} image(s) analysée(s) avec succès ! Utilisez la barre de recherche ci-dessous.")
     else:
         gr.Info(f"✅ {len(current_state.analyses)} image(s) déjà analysée(s) et prêtes pour la recherche.")
-    
+
     return "", current_state
 
 def page_recherche_search(query: str, current_state):
@@ -890,10 +1054,10 @@ def page_recherche_search(query: str, current_state):
             score_color = "#dc3545"
             score_label = "Faible pertinence"
         
-        # Convertir l'image en base64 pour affichage
+        # Convertir l'image en base64 pour affichage (généré à la volée depuis le disque)
         image_base64 = ""
-        if "image" in analysis and analysis["image"] is not None:
-            image_base64 = pil_to_base64(analysis["image"], max_size=(350, 350))
+        if analysis.get("path"):
+            image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(350, 350))
         
         html += f"""
         <div style="background: white; border: 2px solid {score_color}; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
@@ -1067,25 +1231,31 @@ CATEGORIES_POLICE = {
     }
 }
 
+def _clean_vqa_answer(decoded: str, prompt: str) -> str:
+    """Retire l'écho éventuel du prompt renvoyé par le decoder avant la réponse"""
+    answer = decoded.strip()
+    if answer.lower().startswith(prompt.lower()):
+        answer = answer[len(prompt):].strip()
+    elif "answer:" in answer.lower():
+        answer = answer[answer.lower().rindex("answer:") + len("answer:"):].strip()
+    return answer.lower().strip()
+
 def ask_vqa_question(image: Image.Image, question: str) -> str:
     """Pose une question ouverte à une image via BLIP-2 (format prompt "Question: ... Answer:")"""
+    return ask_vqa_questions_batch([image], question)[0]
+
+def ask_vqa_questions_batch(images: List[Image.Image], question: str) -> List[str]:
+    """Pose la même question ouverte à un lot d'images en un seul passage BLIP-2"""
     load_models()
     try:
         prompt = f"Question: {question} Answer:"
-        inputs = processor(images=image, text=prompt, return_tensors="pt").to(device, MODEL_DTYPE)
+        inputs = processor(images=images, text=[prompt] * len(images), return_tensors="pt").to(device, MODEL_DTYPE)
         out = model.generate(**inputs, max_new_tokens=40)
-        answer = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
-
-        # Le decoder peut renvoyer le prompt en écho avant la réponse : on le retire
-        if answer.lower().startswith(prompt.lower()):
-            answer = answer[len(prompt):].strip()
-        elif "answer:" in answer.lower():
-            answer = answer[answer.lower().rindex("answer:") + len("answer:"):].strip()
-
-        return answer.lower().strip()
+        decoded = processor.batch_decode(out, skip_special_tokens=True)
+        return [_clean_vqa_answer(d, prompt) for d in decoded]
     except Exception as e:
-        print(f"Erreur VQA: {e}")
-        return ""
+        print(f"Erreur VQA batch: {e}")
+        return [""] * len(images)
 
 # Questions ouvertes communes posées UNE SEULE FOIS par image (au lieu d'une
 # question fermée par catégorie) : BLIP-2 génère du texte libre, donc on
@@ -1100,24 +1270,30 @@ GENERAL_VQA_QUESTIONS = [
 def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     """
     Classifie une image dans une ou plusieurs catégories de manière interprétative.
-    Pose 3 questions ouvertes communes UNE FOIS par image, puis cherche les
-    mots-clés de chaque catégorie dans la description et les réponses.
-    Retourne une liste de catégories (multi-catégories possible)
+    Pose 3 questions ouvertes communes UNE FOIS par image (mode single-image ;
+    voir categories_from_text pour le mode batché qui réutilise la même logique
+    de scoring à partir de descriptions/réponses déjà calculées).
     """
     image = image_data["image"]
-    categories_assigned = []
-
-    # 1. Description + réponses aux questions ouvertes (3 appels VQA au total,
-    # au lieu d'une question fermée par catégorie)
     description = generate_caption(image).lower()
     vqa_answers = [ask_vqa_question(image, question) for question in GENERAL_VQA_QUESTIONS]
-    combined_text = " ".join([description] + vqa_answers)
 
     print(f"\n=== Analyzing image {image_id} ===")
     print(f"Description: {description}")
     print(f"VQA answers: {vqa_answers}")
 
-    # 2. Configuration des catégories : mots-clés cherchés dans description + réponses
+    return categories_from_text(description, vqa_answers)
+
+def categories_from_text(description: str, vqa_answers: List[str]) -> List[str]:
+    """
+    Déduit les catégories d'une image à partir d'une description et de réponses
+    VQA déjà calculées (mutualisé entre le mode single-image et le mode batché
+    de l'analyse en masse). Retourne une liste de catégories (multi-label).
+    """
+    combined_text = " ".join([description.lower()] + [a.lower() for a in vqa_answers])
+    categories_assigned = []
+
+    # Configuration des catégories : mots-clés cherchés dans description + réponses
     category_analysis = {
         "people": {
             "keywords": ["person", "man", "woman", "people", "child", "boy", "girl", "human", "face", "crowd", "group"],
@@ -1220,7 +1396,7 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     print(f"Final categories: {categories_assigned}\n")
     return categories_assigned
 
-def page_categorisation_analyze(current_state):
+def page_categorisation_analyze(current_state, progress: gr.Progress = gr.Progress()):
     """Analyse et catégorise toutes les images"""
     if current_state is None or len(current_state.images) == 0:
         return """
@@ -1228,28 +1404,20 @@ def page_categorisation_analyze(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state, "", {}, gr.Group(visible=True), gr.Group(visible=False)
-    
-    # S'assurer que les images sont analysées (descriptions, tags)
+
+    # L'analyse par lots (analyze_all_images) calcule déjà description + tags +
+    # catégories en un seul passage BLIP-2 : pas besoin de reclassifier ici.
     if len(current_state.analyses) < len(current_state.images):
-        current_state = analyze_all_images(current_state)
-    
-    # Catégoriser chaque image
+        current_state = analyze_all_images(current_state, progress=progress)
+
+    # Compter les catégories déjà calculées
     categories_count = {cat: 0 for cat in CATEGORIES_POLICE.keys()}
-    
-    for idx, img_data in enumerate(current_state.images):
-        if idx in current_state.analyses:
-            analysis = current_state.analyses[idx]
-            
-            # Toujours re-classifier (forcer la re-classification)
-            print(f"Classifying image {idx}: {img_data.get('filename', 'unknown')}")
-            categories = classify_image_by_category(img_data, idx)
-            analysis["categories"] = categories
-            
-            # Compter les catégories
-            for cat in categories:
-                if cat in categories_count:
-                    categories_count[cat] += 1
-    
+
+    for analysis in current_state.analyses.values():
+        for cat in analysis.get("categories", []):
+            if cat in categories_count:
+                categories_count[cat] += 1
+
     # Notification de succès
     gr.Info(f"✅ {len(current_state.images)} image(s) catégorisée(s) avec succès ! Cliquez sur une catégorie à gauche.")
     
@@ -1443,11 +1611,11 @@ def page_categorisation_filter(category_id: str, current_state):
                     </span>
                     """
         
-        # Générer l'aperçu de l'image
+        # Générer l'aperçu de l'image (à la volée depuis le disque)
         image_preview = ""
-        if "image" in analysis and analysis["image"] is not None:
+        if analysis.get("path"):
             try:
-                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(300, 300))
                 if image_base64:
                     image_preview = f"""
                     <div style="margin: 10px 0; text-align: center;">
@@ -1600,7 +1768,7 @@ def classify_by_investigation_relevance(score: int) -> str:
     else:
         return "non_pertinent"
 
-def page_analyse_sort_all(current_state):
+def page_analyse_sort_all(current_state, progress: gr.Progress = gr.Progress()):
     """
     Trie toutes les images selon leur pertinence pour l'enquête
     """
@@ -1610,10 +1778,10 @@ def page_analyse_sort_all(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state, {}
-    
+
     # S'assurer que les images sont analysées
     if len(current_state.analyses) < len(current_state.images):
-        current_state = analyze_all_images(current_state)
+        current_state = analyze_all_images(current_state, progress=progress)
     
     # Calculer le score de pertinence pour chaque image
     contexte = current_state.enquete_info.get("contexte", "")
@@ -1742,11 +1910,11 @@ def page_analyse_filter_by_relevance(relevance_category: str, current_state):
                     </span>
                     """
         
-        # Générer l'aperçu de l'image
+        # Générer l'aperçu de l'image (à la volée depuis le disque)
         image_preview = ""
-        if "image" in analysis and analysis["image"] is not None:
+        if analysis.get("path"):
             try:
-                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(300, 300))
                 if image_base64:
                     image_preview = f"""
                     <div style="margin: 10px 0; text-align: center;">
