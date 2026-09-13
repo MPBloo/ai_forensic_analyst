@@ -1,5 +1,6 @@
 import gradio as gr
-from transformers import BlipProcessor, BlipForConditionalGeneration, BlipForQuestionAnswering
+from transformers import Blip2Processor, Blip2ForConditionalGeneration, BitsAndBytesConfig
+from sentence_transformers import SentenceTransformer, util
 from PIL import Image
 import torch
 from typing import List, Dict, Tuple, Optional
@@ -7,28 +8,135 @@ import pandas as pd
 from datetime import datetime
 import json
 import base64
+import os
+import sqlite3
+import hashlib
+import time
 from io import BytesIO
 
 # Configuration du device
 device = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "Salesforce/blip2-opt-2.7b"
+# Dtype utilisé pour les tenseurs d'entrée envoyés au modèle (doit matcher le
+# compute_dtype de la quantization 4-bit sur GPU ; fp32 en fallback CPU)
+MODEL_DTYPE = torch.float16 if device == "cuda" else torch.float32
 
-
-# Chargement des modèles BLIP (lazy loading pour économiser la mémoire)
+# Chargement du modèle BLIP-2 (lazy loading). Un seul modèle sert à la fois
+# au captioning et au VQA (BLIP-2 fait les deux via le même decoder, piloté
+# par le prompt texte optionnel passé au processor).
 processor = None
-caption_model = None
-vqa_model = None
+model = None
 
 def load_models():
-    """Charge les modèles BLIP si nécessaire"""
-    global processor, caption_model, vqa_model
-    if processor is None:
-        print(" Chargement des modèles BLIP...")
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
-        vqa_model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base").to(device)
-        print("Modèles BLIP chargés avec succès !")
+    """Charge BLIP-2 si nécessaire : 4-bit (nf4) sur GPU, fp32 sur CPU en fallback explicite"""
+    global processor, model
+    if processor is not None:
+        return
 
-# CSS personnalisé 
+    processor = Blip2Processor.from_pretrained(MODEL_NAME)
+
+    if device == "cuda":
+        print(f" Chargement de {MODEL_NAME} en 4-bit (nf4, double quant)...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = Blip2ForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            quantization_config=quantization_config,
+            device_map="auto",
+        )
+    else:
+        print(
+            " CUDA indisponible : la quantization 4-bit (bitsandbytes) nécessite un GPU. "
+            f"Chargement de {MODEL_NAME} en fp32 sur CPU à la place — l'inférence sera très lente."
+        )
+        model = Blip2ForConditionalGeneration.from_pretrained(MODEL_NAME, torch_dtype=torch.float32).to(device)
+
+    print(f"{MODEL_NAME} chargé avec succès !")
+
+# ============================================================================
+# PERSISTANCE SQLITE - Reprise après interruption sur de gros lots d'images
+# ============================================================================
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iargos_analysis.db")
+
+def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+    """Ouvre une connexion SQLite et crée la table images si nécessaire"""
+    conn = sqlite3.connect(db_path or DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS images (
+            path TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            description TEXT,
+            categories TEXT,
+            relevance_score INTEGER,
+            analyzed_at TEXT
+        )
+    """)
+    return conn
+
+def compute_sha256(path: str) -> str:
+    """Hash le contenu d'un fichier par blocs (pas de chargement complet en mémoire)"""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def get_analyzed_paths(db_path: Optional[str] = None) -> set:
+    """Chemins déjà analysés et présents en base (pour sauter les images déjà traitées)"""
+    conn = get_db_connection(db_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT path FROM images")}
+    finally:
+        conn.close()
+
+def load_image_analysis(path: str, db_path: Optional[str] = None) -> Optional[dict]:
+    """Recharge le résultat d'analyse d'une image déjà en base"""
+    conn = get_db_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT path, filename, description, categories FROM images WHERE path = ?",
+            (path,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "path": row[0],
+        "filename": row[1],
+        "description": row[2] or "",
+        "categories": json.loads(row[3]) if row[3] else [],
+    }
+
+def save_image_analysis(record: dict, db_path: Optional[str] = None) -> None:
+    """Sauvegarde (ou met à jour) le résultat d'analyse d'une image"""
+    conn = get_db_connection(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO images (path, filename, sha256, description, categories, relevance_score, analyzed_at)
+            VALUES (:path, :filename, :sha256, :description, :categories, :relevance_score, :analyzed_at)
+            ON CONFLICT(path) DO UPDATE SET
+                filename=excluded.filename,
+                sha256=excluded.sha256,
+                description=excluded.description,
+                categories=excluded.categories,
+                relevance_score=excluded.relevance_score,
+                analyzed_at=excluded.analyzed_at
+            """,
+            record,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# CSS personnalisé
 CUSTOM_CSS = """
 /* Palette de couleurs police française */
 :root {
@@ -370,16 +478,19 @@ class EnqueteData:
         self.tags_global = []  # Tous les tags extraits
 
 # ============================================================================
-# FONCTIONS D'ANALYSE IA - BLIP
+# FONCTIONS D'ANALYSE IA - BLIP-2
 # ============================================================================
 
 def generate_caption(image: Image.Image) -> str:
-    """Génère une description textuelle de l'image avec BLIP"""
+    """Génère une description textuelle d'une image avec BLIP-2"""
+    return generate_captions_batch([image])[0]
+
+def generate_captions_batch(images: List[Image.Image]) -> List[str]:
+    """Génère les descriptions d'un lot d'images en un seul passage BLIP-2"""
     load_models()
-    inputs = processor(image, return_tensors="pt").to(device) # transforme l'imahge en tenseurs et retourne un dico et utilise pytorch
-    out = caption_model.generate(**inputs, max_length=100) #attention ici on se limite à 100 tokens 
-    caption = processor.decode(out[0], skip_special_tokens=True)
-    return caption
+    inputs = processor(images=images, return_tensors="pt").to(device, MODEL_DTYPE)
+    out = model.generate(**inputs, max_new_tokens=50)
+    return [caption.strip() for caption in processor.batch_decode(out, skip_special_tokens=True)]
 
 """ Après coup, cette fonction est sans doute inutile et un peu surfaite"""
 
@@ -449,54 +560,130 @@ def calculate_relevance_score(description: str, tags: List[str], contexte_enquet
 
 
 
-def analyze_image_complete(image_data: dict, contexte_enquete: str, image_id: int) -> dict:
+def analyze_all_images(state: EnqueteData, batch_size: int = 4, progress: Optional[gr.Progress] = None) -> EnqueteData:
     """
-    Analyse complète d'une image : description, tags, score
-    """
-    try:
-        description = generate_caption(image_data["image"])
-        tags = extract_tags_from_description(description)
-        score = calculate_relevance_score(description, tags, contexte_enquete)
-        
-        return {
-            "id": image_id,
-            "filename": image_data["filename"],
-            "image": image_data["image"],
-            "description": description,
-            "tags": tags,
-            "score": score,
-            "analyzed": True
-        }
-    except Exception as e:
-        print(f"Erreur lors de l'analyse de {image_data.get('filename', 'image')}: {e}")
-        return {
-            "id": image_id,
-            "filename": image_data.get("filename", "unknown"),
-            "image": image_data.get("image"),
-            "description": "Erreur d'analyse",
-            "tags": [],
-            "score": 0,
-            "analyzed": False
-        }
+    Analyse (description + tags + score + catégories) les images pas encore
+    analysées, par lots de `batch_size` images (réduit automatiquement de
+    moitié en cas d'OOM GPU, jusqu'à 1). Ne garde en RAM que le lot courant :
+    les images sont ouvertes depuis leur chemin sur disque juste avant
+    traitement, jamais chargées toutes d'un coup (contrainte : ~2000 images
+    sur un GPU à ~4 Go de VRAM).
 
-def analyze_all_images(state: EnqueteData, progress_callback=None) -> EnqueteData:
-    """Analyse toutes les images de l'enquête"""
+    Les résultats sont persistés en SQLite au fur et à mesure (voir
+    save_image_analysis) : une interruption (crash, Ctrl+C) ne fait perdre
+    que le lot en cours, pas le travail déjà fait — les images déjà en base
+    sont sautées au relancement.
+    """
     contexte = state.enquete_info.get("contexte", "")
-    
-    for idx, img_data in enumerate(state.images):
-        # Vérifier si l'image a déjà été analysée
-        if idx not in state.analyses or not state.analyses[idx].get("analyzed", False):
-            analysis = analyze_image_complete(img_data, contexte, idx)
-            state.analyses[idx] = analysis
-            
-            # Ajouter les tags au pool global
-            for tag in analysis["tags"]:
-                if tag not in state.tags_global:
-                    state.tags_global.append(tag)
-            
-            if progress_callback:
-                progress_callback(f"Analyse {idx + 1}/{len(state.images)}...")
-    
+    analyzed_paths_in_db = get_analyzed_paths()
+
+    to_process = [
+        (idx, img_data) for idx, img_data in enumerate(state.images)
+        if idx not in state.analyses or not state.analyses[idx].get("analyzed", False)
+    ]
+    total = len(to_process)
+    if total == 0:
+        return state
+
+    current_batch_size = max(1, batch_size)
+    processed = 0
+    start_time = time.time()
+    i = 0
+
+    while i < len(to_process):
+        batch = to_process[i:i + current_batch_size]
+
+        images = []
+        valid_entries = []  # (idx, img_data) pour les images réellement passées à BLIP-2
+        for idx, img_data in batch:
+            path = img_data["path"]
+
+            # Reprise après interruption : déjà en base, pas besoin de repasser BLIP-2 dessus
+            if path in analyzed_paths_in_db:
+                cached = load_image_analysis(path)
+                if cached:
+                    description = cached["description"]
+                    tags = extract_tags_from_description(description)
+                    state.analyses[idx] = {
+                        "id": idx, "filename": img_data["filename"], "path": path,
+                        "description": description, "tags": tags,
+                        "categories": cached["categories"],
+                        "score": calculate_relevance_score(description, tags, contexte),
+                        "analyzed": True,
+                    }
+                    for tag in tags:
+                        if tag not in state.tags_global:
+                            state.tags_global.append(tag)
+                    processed += 1
+                    continue
+
+            try:
+                with Image.open(path) as raw:
+                    images.append(raw.convert("RGB"))
+                valid_entries.append((idx, img_data))
+            except Exception as e:
+                print(f"Erreur lors de l'analyse de {img_data.get('filename', 'image')}: {e}")
+                state.analyses[idx] = {
+                    "id": idx, "filename": img_data.get("filename", "unknown"), "path": path,
+                    "description": "Erreur d'analyse", "tags": [], "categories": [], "score": 0,
+                    "analyzed": False,
+                }
+                processed += 1
+
+        if images:
+            try:
+                captions = generate_captions_batch(images)
+                answers_per_question = [ask_vqa_questions_batch(images, q) for q in GENERAL_VQA_QUESTIONS]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                for img in images:
+                    img.close()
+                if current_batch_size > 1:
+                    current_batch_size = max(1, current_batch_size // 2)
+                    print(f"⚠️ OOM GPU détecté, réduction du batch à {current_batch_size} image(s)")
+                    continue  # on ne fait pas avancer i : on réessaie ce même lot, plus petit
+                raise
+
+            for pos, (idx, img_data) in enumerate(valid_entries):
+                description = captions[pos]
+                vqa_answers = [answers_per_question[q_idx][pos] for q_idx in range(len(GENERAL_VQA_QUESTIONS))]
+                categories = categories_from_text(description, vqa_answers)
+                tags = extract_tags_from_description(description)
+                score = calculate_relevance_score(description, tags, contexte)
+                path = img_data["path"]
+
+                state.analyses[idx] = {
+                    "id": idx, "filename": img_data["filename"], "path": path,
+                    "description": description, "tags": tags, "categories": categories,
+                    "score": score, "analyzed": True,
+                }
+                for tag in tags:
+                    if tag not in state.tags_global:
+                        state.tags_global.append(tag)
+
+                try:
+                    save_image_analysis({
+                        "path": path, "filename": img_data["filename"],
+                        "sha256": compute_sha256(path), "description": description,
+                        "categories": json.dumps(categories), "relevance_score": score,
+                        "analyzed_at": datetime.now().isoformat(),
+                    })
+                except Exception as e:
+                    print(f"Erreur persistance SQLite pour {path}: {e}")
+
+                processed += 1
+
+            for img in images:
+                img.close()
+
+        elapsed_minutes = max((time.time() - start_time) / 60, 1e-9)
+        throughput = processed / elapsed_minutes
+        print(f"Débit: {throughput:.1f} images/minute ({processed}/{total})")
+        if progress is not None:
+            progress(processed / total, desc=f"{processed}/{total} images analysées ({throughput:.1f} img/min)")
+
+        i += len(batch)
+
     return state
 
 # ============================================================================
@@ -517,19 +704,21 @@ def page_accueil_init_images(files, current_state):
     else:
         state = current_state
     
-    # Charger les images
+    # Enregistrer uniquement les chemins (pas de chargement PIL à l'upload :
+    # avec ~2000 images, les garder toutes ouvertes en RAM n'est pas tenable).
+    # La validité de chaque fichier est vérifiée plus tard, image par image,
+    # au moment de l'analyse par lots (analyze_all_images).
     new_images = []
     for file_path in files:
-        try:
-            img = Image.open(file_path).convert('RGB')
-            new_images.append({
-                "image": img,
-                "filename": file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1],
-                "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-        except Exception as e:
-            print(f"Erreur lors du chargement de {file_path}: {e}")
-    
+        if not os.path.isfile(file_path):
+            print(f"Fichier introuvable: {file_path}")
+            continue
+        new_images.append({
+            "path": file_path,
+            "filename": file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1],
+            "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
     state.images.extend(new_images)
     state.enquete_info["nombre_images"] = len(state.images)
     
@@ -583,31 +772,31 @@ def generate_stats_html(state: EnqueteData) -> str:
 # UTILITAIRES - Conversion images
 # ============================================================================
 
-def pil_to_base64(image: Image.Image, max_size=(400, 400)) -> str:
+def pil_to_base64_from_path(path: str, max_size=(400, 400)) -> str:
     """
-    Convertit une image PIL en base64 pour affichage HTML
-    Redimensionne l'image pour optimiser les performances
+    Génère une vignette base64 à la volée depuis un fichier sur disque, pour
+    affichage HTML. Aucune image PIL n'est conservée en mémoire dans
+    EnqueteData : on ouvre, on redimensionne, on encode, on referme.
     """
     try:
-        # Redimensionner l'image pour l'aperçu (économiser bande passante)
-        img_copy = image.copy()
-        img_copy.thumbnail(max_size, Image.Resampling.LANCZOS)
-        
-        # Convertir en base64
-        buffered = BytesIO()
-        img_copy.save(buffered, format="JPEG", quality=85)
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        return f"data:image/jpeg;base64,{img_str}"
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            return f"data:image/jpeg;base64,{img_str}"
     except Exception as e:
-        print(f"Erreur conversion image: {e}")
+        print(f"Erreur conversion image {path}: {e}")
         return ""
 
 # ============================================================================
 # PAGE 2 : RECHERCHE - Recherche textuelle dans les images
 # ============================================================================
 
-def page_recherche_analyze_if_needed(current_state):
+def page_recherche_analyze_if_needed(current_state, progress: gr.Progress = gr.Progress()):
     """Lance l'analyse des images si pas encore fait"""
     if current_state is None or len(current_state.images) == 0:
         return """
@@ -615,21 +804,21 @@ def page_recherche_analyze_if_needed(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state
-    
+
     # Vérifier si toutes les images ont été analysées
     needs_analysis = False
     for idx in range(len(current_state.images)):
         if idx not in current_state.analyses or not current_state.analyses[idx].get("analyzed", False):
             needs_analysis = True
             break
-    
+
     if needs_analysis:
-        gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP... Veuillez patienter.")
-        current_state = analyze_all_images(current_state)
+        gr.Info(f"🔄 Analyse de {len(current_state.images)} image(s) en cours avec BLIP-2... Veuillez patienter.")
+        current_state = analyze_all_images(current_state, progress=progress)
         gr.Info(f"✅ {len(current_state.images)} image(s) analysée(s) avec succès ! Utilisez la barre de recherche ci-dessous.")
     else:
         gr.Info(f"✅ {len(current_state.analyses)} image(s) déjà analysée(s) et prêtes pour la recherche.")
-    
+
     return "", current_state
 
 def page_recherche_search(query: str, current_state):
@@ -865,10 +1054,10 @@ def page_recherche_search(query: str, current_state):
             score_color = "#dc3545"
             score_label = "Faible pertinence"
         
-        # Convertir l'image en base64 pour affichage
+        # Convertir l'image en base64 pour affichage (généré à la volée depuis le disque)
         image_base64 = ""
-        if "image" in analysis and analysis["image"] is not None:
-            image_base64 = pil_to_base64(analysis["image"], max_size=(350, 350))
+        if analysis.get("path"):
+            image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(350, 350))
         
         html += f"""
         <div style="background: white; border: 2px solid {score_color}; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
@@ -961,7 +1150,7 @@ def page_recherche_search(query: str, current_state):
 # PAGE 3 : CATÉGORISATION - Classification automatique par catégories
 # ============================================================================
 
-# Définition des catégories pour enquêtes de police (EN ANGLAIS pour compatibilité BLIP)
+# Définition des catégories pour enquêtes de police (EN ANGLAIS pour compatibilité BLIP-2)
 CATEGORIES_POLICE = {
     "people": {
         "icon": "👤",
@@ -1042,213 +1231,122 @@ CATEGORIES_POLICE = {
     }
 }
 
+def _clean_vqa_answer(decoded: str, prompt: str) -> str:
+    """Retire l'écho éventuel du prompt renvoyé par le decoder avant la réponse"""
+    answer = decoded.strip()
+    if answer.lower().startswith(prompt.lower()):
+        answer = answer[len(prompt):].strip()
+    elif "answer:" in answer.lower():
+        answer = answer[answer.lower().rindex("answer:") + len("answer:"):].strip()
+    return answer.lower().strip()
+
 def ask_vqa_question(image: Image.Image, question: str) -> str:
-    """Pose une question VQA à une image"""
+    """Pose une question ouverte à une image via BLIP-2 (format prompt "Question: ... Answer:")"""
+    return ask_vqa_questions_batch([image], question)[0]
+
+def ask_vqa_questions_batch(images: List[Image.Image], question: str) -> List[str]:
+    """Pose la même question ouverte à un lot d'images en un seul passage BLIP-2"""
     load_models()
     try:
-        inputs = processor(image, question, return_tensors="pt").to(device)
-        out = vqa_model.generate(**inputs, max_length=50)
-        answer = processor.decode(out[0], skip_special_tokens=True)
-        return answer.lower().strip()
+        prompt = f"Question: {question} Answer:"
+        inputs = processor(images=images, text=[prompt] * len(images), return_tensors="pt").to(device, MODEL_DTYPE)
+        out = model.generate(**inputs, max_new_tokens=40)
+        decoded = processor.batch_decode(out, skip_special_tokens=True)
+        return [_clean_vqa_answer(d, prompt) for d in decoded]
     except Exception as e:
-        print(f"Erreur VQA: {e}")
-        return ""
+        print(f"Erreur VQA batch: {e}")
+        return [""] * len(images)
+
+# Questions ouvertes communes posées UNE SEULE FOIS par image (au lieu d'une
+# question fermée par catégorie) : BLIP-2 génère du texte libre, donc on
+# cherche ensuite les mots-clés de chaque catégorie dans les réponses plutôt
+# que d'interpréter des "yes"/"no".
+GENERAL_VQA_QUESTIONS = [
+    "What objects are visible in this image?",
+    "Where was this photo taken?",
+    "What is happening in this image?",
+]
 
 def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
     """
-    Classifie une image dans une ou plusieurs catégories de manière interprétative
-    AMÉLIORÉ : Utilise PLUSIEURS questions VQA détaillées par catégorie
-    Retourne une liste de catégories (multi-catégories possible)
+    Classifie une image dans une ou plusieurs catégories de manière interprétative.
+    Pose 3 questions ouvertes communes UNE FOIS par image (mode single-image ;
+    voir categories_from_text pour le mode batché qui réutilise la même logique
+    de scoring à partir de descriptions/réponses déjà calculées).
     """
     image = image_data["image"]
-    categories_assigned = []
-    
-    # 1. Obtenir la description de l'image
     description = generate_caption(image).lower()
+    vqa_answers = [ask_vqa_question(image, question) for question in GENERAL_VQA_QUESTIONS]
+
     print(f"\n=== Analyzing image {image_id} ===")
     print(f"Description: {description}")
-    
-    # 2. Configuration des catégories avec QUESTIONS MULTIPLES détaillées
+    print(f"VQA answers: {vqa_answers}")
+
+    return categories_from_text(description, vqa_answers)
+
+def categories_from_text(description: str, vqa_answers: List[str]) -> List[str]:
+    """
+    Déduit les catégories d'une image à partir d'une description et de réponses
+    VQA déjà calculées (mutualisé entre le mode single-image et le mode batché
+    de l'analyse en masse). Retourne une liste de catégories (multi-label).
+    """
+    combined_text = " ".join([description.lower()] + [a.lower() for a in vqa_answers])
+    categories_assigned = []
+
+    # Configuration des catégories : mots-clés cherchés dans description + réponses
     category_analysis = {
         "people": {
             "keywords": ["person", "man", "woman", "people", "child", "boy", "girl", "human", "face", "crowd", "group"],
-            "vqa_questions": [
-                "Are there any people, persons, or human beings visible in this image?",
-                "Can you see a man, woman, or child in this picture?",
-                "Is there a human face or body visible?"
-            ],
             "weight": 1.0
         },
         "vehicles": {
             "keywords": ["car", "vehicle", "truck", "motorcycle", "bike", "bus", "train", "automobile", "taxi", "van"],
-            "vqa_questions": [
-                "Can you see any vehicles, cars, or means of transportation?",
-                "Is there a car, truck, motorcycle, or bicycle in this image?",
-                "Are there any wheels or vehicle parts visible?"
-            ],
             "weight": 1.0
         },
         "weapons": {
             "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm", "cutting"],
-            "vqa_questions": [
-                "Is there a knife, blade, or sharp cutting tool visible in this image?",
-                "Can you see a gun, firearm, rifle, or pistol?",
-                "What tool or implement is being used or held in this image?",
-                "Are there any weapons, blades, or sharp metallic objects?"
-            ],
-            "weight": 1.2,
-            # Liste d'exclusion STRICTE pour éviter faux positifs
-            "exclude_keywords": ["dog", "cat", "pet", "animal", "bird", "horse"],
-            # Si SEULEMENT ces mots apparaissent (sans knife/gun/blade), alors exclure
-            "exclude_only_if_alone": True
+            "weight": 1.2
         },
         "documents": {
             "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
-            "vqa_questions": [
-                "Is there any text, document, or written content visible?",
-                "Can you see any words, letters, or writing in this image?",
-                "Are there any signs, papers, or documents?"
-            ],
             "weight": 1.0
         },
         "buildings": {
             "keywords": ["building", "house", "structure", "architecture", "wall", "door", "window", "roof", "facade"],
-            "vqa_questions": [
-                "Can you see any buildings, houses, or architectural structures?",
-                "Is there a wall, door, window, or building structure visible?",
-                "Is this image taken in front of or inside a building?"
-            ],
             "weight": 1.0
         },
         "outdoor": {
             "keywords": ["outdoor", "outside", "street", "road", "park", "sky", "nature", "exterior", "sidewalk"],
-            "vqa_questions": [
-                "Is this an outdoor scene or taken outside?",
-                "Can you see the sky, street, or outdoor environment?"
-            ],
             "weight": 0.8
         },
         "indoor": {
             "keywords": ["indoor", "inside", "room", "interior", "ceiling", "floor", "furniture", "wall"],
-            "vqa_questions": [
-                "Is this an indoor scene or taken inside a building?",
-                "Can you see a room, ceiling, or interior space?"
-            ],
             "weight": 0.8
         },
         "objects": {
             "keywords": ["object", "item", "thing", "tool", "equipment", "device", "bag", "box", "bottle", "holding"],
-            "vqa_questions": [
-                "Are there any specific objects, items, or things in this image?",
-                "What objects or items can you see in this picture?"
-            ],
             "weight": 0.7
         },
         "animals": {
             "keywords": ["dog", "cat", "animal", "pet", "bird", "horse"],
-            "vqa_questions": [
-                "Is there a dog, cat, or any animal in this image?",
-                "Can you see a pet or animal?"
-            ],
             "weight": 0.6  # Poids faible, généralement pas prioritaire pour enquêtes
         },
         "advertising": {
             "keywords": ["advertisement", "ad", "brand", "logo", "commercial", "marketing", "poster", "billboard", "sign", "promotion"],
-            "vqa_questions": [
-                "Is this an advertisement, commercial poster, or marketing material?",
-                "Can you see any brand logos, company names, or advertising content?",
-                "Is there any commercial branding or promotional content visible?",
-                "Does this image contain advertising, marketing, or promotional material?"
-            ],
             "weight": 0.5  # Poids faible, généralement pas prioritaire pour enquêtes
         }
     }
-    
-    # 3. Scorer chaque catégorie de manière intelligente avec QUESTIONS MULTIPLES
+
+    # 3. Scorer chaque catégorie selon le nombre de mots-clés trouvés
     category_scores = {}
-    
+
     for category, config in category_analysis.items():
-        score = 0.0
-        
-        # A. Analyse des mots-clés dans la description
-        keyword_matches = sum(1 for keyword in config["keywords"] if keyword in description)
+        keyword_matches = sum(1 for keyword in config["keywords"] if keyword in combined_text)
+        score = (keyword_matches * 25) * config["weight"]
         if keyword_matches > 0:
-            score += (keyword_matches * 20) * config["weight"]
-            print(f"{category}: Found {keyword_matches} keyword(s) in description")
-        
-        # B. Poser TOUTES les questions VQA pour cette catégorie
-        positive_answers = 0
-        total_questions = len(config["vqa_questions"])
-        has_exclusion = False
-        
-        for i, question in enumerate(config["vqa_questions"]):
-            vqa_answer = ask_vqa_question(image, question)
-            print(f"{category} VQA Q{i+1}/{total_questions}: '{vqa_answer}'")
-            
-        if vqa_answer:
-            vqa_lower = vqa_answer.lower()
-            
-            # VÉRIFICATION D'EXCLUSION (pour éviter faux positifs)
-            exclude_list = config.get("exclude_keywords", [])
-            if exclude_list:
-                # Vérifier si des mots d'exclusion sont présents
-                excluded_found = [e for e in exclude_list if e in vqa_lower]
-                
-                if excluded_found:
-                    # Vérifier si c'est SEULEMENT un animal/objet quotidien (sans arme réelle)
-                    weapon_words = ["knife", "gun", "blade", "weapon", "rifle", "pistol", "sharp", "cutting"]
-                    has_weapon_word = any(w in vqa_lower for w in weapon_words)
-                    
-                    # Si SEULEMENT animal/quotidien SANS mot d'arme → exclusion
-                    if not has_weapon_word and config.get("exclude_only_if_alone", False):
-                        print(f"  → Q{i+1} EXCLUDED (faux positif: {excluded_found}, pas d'arme réelle)")
-                        has_exclusion = True
-                        score -= 20  # Pénalité
-                        continue
-                    elif not has_weapon_word:
-                        # Petite pénalité mais pas exclusion totale
-                        score -= 5
-                        print(f"  → Q{i+1} Objet quotidien détecté ({excluded_found}), pénalité légère")
-                
-                # Réponses positives claires
-                if any(word in vqa_lower for word in ["yes", "true", "there is", "there are", "visible", "can see", "holding"]):
-                    positive_answers += 1
-                score += 25 * config["weight"]
-                    print(f"  → Q{i+1} Positive (+{25 * config['weight']:.1f})")
-                
-                # Réponses négatives claires
-                elif any(word in vqa_lower for word in ["no", "not", "none", "cannot", "can't", "nothing"]):
-                    score -= 5
-                    print(f"  → Q{i+1} Negative (-5)")
-                
-                # Réponses contenant des éléments de la catégorie (détection implicite)
-                elif any(keyword in vqa_lower for keyword in config["keywords"][:8]):
-                    positive_answers += 0.5
-                    score += 20 * config["weight"]
-                    print(f"  → Q{i+1} Mentions category (+{20 * config['weight']:.1f})")
-                
-                # Réponses descriptives (ex: "knife", "cutting tool")
-                else:
-                    # Vérifier si la réponse contient des mots pertinents
-                    answer_words = vqa_lower.split()
-                    if any(word in answer_words for word in config["keywords"][:10]):
-                        positive_answers += 0.3
-                        score += 15 * config["weight"]
-                        print(f"  → Q{i+1} Descriptive match (+{15 * config['weight']:.1f})")
-        
-        # Si exclusion détectée, annuler le score pour cette catégorie
-        if has_exclusion and category == "weapons":
-            score = max(0, score - 30)  # Pénalité supplémentaire pour weapons
-            print(f"  → EXCLUSION penalty applied, score reduced")
-        
-        # Bonus si plusieurs questions confirment la catégorie
-        if positive_answers >= 2:
-            bonus = 20 * config["weight"]
-            score += bonus
-            print(f"  → Multiple confirmations bonus (+{bonus:.1f})")
-        
+            print(f"{category}: {keyword_matches} mot(s)-clé(s) trouvé(s) (score={score:.1f})")
         category_scores[category] = score
-    
+
     # 4. Sélection des catégories avec seuil adaptatif
     # Seuils différents selon la catégorie pour éviter faux positifs
     category_thresholds = {
@@ -1260,27 +1358,27 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         "outdoor": 15,
         "indoor": 15,
         "objects": 25,      # Seuil plus élevé car très générique
-        "animals": 18,      # Seuil normal pour animaux
+        "animals": 15,      # Seuil bas : une seule mention (ex. "dog") doit suffire
         "advertising": 20   # Seuil normal pour publicité
     }
-    
+
     max_categories = 5
-    
+
     # Trier par score
     sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
-    
+
     print(f"\nScores finaux:")
     for cat, score in sorted_categories:
         threshold = category_thresholds.get(cat, 20)
         print(f"  {cat}: {score:.1f} (seuil: {threshold})")
-    
+
     # Assigner les catégories au-dessus de leur seuil spécifique
     for category, score in sorted_categories:
         threshold = category_thresholds.get(category, 20)
         if score >= threshold and len(categories_assigned) < max_categories:
             categories_assigned.append(category)
             print(f"  ✓ Assigned to {category} (score: {score:.1f}, threshold: {threshold})")
-    
+
     # 5. Gérer les conflits indoor/outdoor
     if "indoor" in categories_assigned and "outdoor" in categories_assigned:
         if category_scores["indoor"] > category_scores["outdoor"]:
@@ -1289,16 +1387,16 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
         else:
             categories_assigned.remove("indoor")
             print("  → Removed 'indoor' (conflict with outdoor)")
-    
+
     # 6. Si aucune catégorie significative
     if not categories_assigned:
         categories_assigned.append("unclassified")
         print("  ✗ No significant category found, marked as unclassified")
-    
+
     print(f"Final categories: {categories_assigned}\n")
     return categories_assigned
 
-def page_categorisation_analyze(current_state):
+def page_categorisation_analyze(current_state, progress: gr.Progress = gr.Progress()):
     """Analyse et catégorise toutes les images"""
     if current_state is None or len(current_state.images) == 0:
         return """
@@ -1306,58 +1404,48 @@ def page_categorisation_analyze(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state, "", {}, gr.Group(visible=True), gr.Group(visible=False)
-    
-    # S'assurer que les images sont analysées (descriptions, tags)
+
+    # L'analyse par lots (analyze_all_images) calcule déjà description + tags +
+    # catégories en un seul passage BLIP-2 : pas besoin de reclassifier ici.
     if len(current_state.analyses) < len(current_state.images):
-        current_state = analyze_all_images(current_state)
-    
-    # Catégoriser chaque image
+        current_state = analyze_all_images(current_state, progress=progress)
+
+    # Compter les catégories déjà calculées
     categories_count = {cat: 0 for cat in CATEGORIES_POLICE.keys()}
-    
-    for idx, img_data in enumerate(current_state.images):
-        if idx in current_state.analyses:
-            analysis = current_state.analyses[idx]
-            
-            # Toujours re-classifier (forcer la re-classification)
-            print(f"Classifying image {idx}: {img_data.get('filename', 'unknown')}")
-            categories = classify_image_by_category(img_data, idx)
-            analysis["categories"] = categories
-            
-            # Compter les catégories
-            for cat in categories:
-                if cat in categories_count:
-                    categories_count[cat] += 1
-    
+
+    for analysis in current_state.analyses.values():
+        for cat in analysis.get("categories", []):
+            if cat in categories_count:
+                categories_count[cat] += 1
+
     # Notification de succès
     gr.Info(f"✅ {len(current_state.images)} image(s) catégorisée(s) avec succès ! Cliquez sur une catégorie à gauche.")
     
     # Générer le HTML des statistiques cliquables
-    stats_html = generate_clickable_categories_stats(categories_count)
+    stats_html = generate_clickable_categories_stats(categories_count, len(current_state.images))
     
     # Retourner avec changement d'état : masquer boutons, afficher stats
     return "", current_state, stats_html, categories_count, gr.Group(visible=False), gr.Group(visible=True)
 
-def generate_clickable_categories_stats(categories_count: dict) -> str:
+def generate_clickable_categories_stats(categories_count: dict, total_images: int) -> str:
     """
     Génère le HTML des statistiques avec instructions pour les boutons Gradio
     """
     html = """
     <div style="font-family: 'Segoe UI', Arial, sans-serif; background: white; border-radius: 8px; padding: 15px; border: 2px solid var(--border-gray);">
     """
-    
-    total_images = sum(categories_count.values())
-    
+
     for cat_id, cat_info in CATEGORIES_POLICE.items():
         count = categories_count.get(cat_id, 0)
         label_display = cat_info.get('label_fr', cat_info['label'])
-        
+
         if count > 0:  # Afficher seulement les catégories avec des images
             percentage = (count / total_images * 100) if total_images > 0 else 0
-        
-        html += f"""
-            <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;" 
+
+            html += f"""
+            <div style="margin: 12px 0; padding: 12px; background: {cat_info['color']}15; border-left: 4px solid {cat_info['color']}; border-radius: 6px; cursor: pointer; transition: all 0.3s ease;"
                  onclick="triggerGradioButton('{cat_id}')"
-                 onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'" 
+                 onmouseover="this.style.background='{cat_info['color']}30'; this.style.transform='translateX(2px)'"
                  onmouseout="this.style.background='{cat_info['color']}15'; this.style.transform='translateX(0px)'">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <div>
@@ -1376,7 +1464,7 @@ def generate_clickable_categories_stats(categories_count: dict) -> str:
             </p>
         </div>
         """
-    
+
     # Bouton "Toutes les images"
     html += f"""
         <div style="margin: 15px 0; padding: 15px; background: var(--light-blue); border-radius: 8px; cursor: pointer; text-align: center; transition: all 0.3s ease;" 
@@ -1523,11 +1611,11 @@ def page_categorisation_filter(category_id: str, current_state):
                     </span>
                     """
         
-        # Générer l'aperçu de l'image
+        # Générer l'aperçu de l'image (à la volée depuis le disque)
         image_preview = ""
-        if "image" in analysis and analysis["image"] is not None:
+        if analysis.get("path"):
             try:
-                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(300, 300))
                 if image_base64:
                     image_preview = f"""
                     <div style="margin: 10px 0; text-align: center;">
@@ -1582,148 +1670,96 @@ def page_categorisation_filter(category_id: str, current_state):
 # PAGE 5 : ANALYSE - Espace de travail avec tri pertinence enquête
 # ============================================================================
 
+# Modèle de similarité sémantique pour le score de contexte (léger, tourne sur
+# CPU sans impact sur la VRAM réservée à BLIP-2). Chargé une seule fois (lazy).
+_semantic_model = None
+# L'embedding du contexte d'enquête est identique pour toutes les images d'une
+# même enquête : on le calcule une fois et on le réutilise (invalidé si le
+# texte du contexte change).
+_context_embedding_cache = {"text": None, "embedding": None}
+
+def _get_semantic_model():
+    global _semantic_model
+    if _semantic_model is None:
+        print(" Chargement du modèle de similarité sémantique (all-MiniLM-L6-v2, CPU)...")
+        _semantic_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    return _semantic_model
+
+def _get_context_embedding(contexte_enquete: str):
+    """Encode le contexte d'enquête, avec cache (identique pour toutes les images)"""
+    if _context_embedding_cache["text"] != contexte_enquete:
+        _context_embedding_cache["embedding"] = _get_semantic_model().encode(contexte_enquete, convert_to_tensor=True)
+        _context_embedding_cache["text"] = contexte_enquete
+    return _context_embedding_cache["embedding"]
+
+CONTENT_SCORE_MAX = 40
+CONTEXT_SCORE_MAX = 60
+
 def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: str) -> int:
     """
-    Calcule un score de pertinence spécifique pour l'enquête (0-100)
-    Système amélioré avec correspondance sémantique flexible
+    Calcule le score de pertinence d'une image pour l'enquête (0-100).
+
+    Le score est la somme de deux composantes qui ne peuvent pas se compenser :
+    - CONTENU (0-40) : ce que l'image contient objectivement (catégories
+      détectées, richesse de la description), indépendant de tout contexte.
+    - CONTEXTE (0-60) : similarité sémantique (cosinus d'embeddings
+      sentence-transformers) entre la description de l'image et le contexte
+      d'enquête fourni par l'utilisateur, plutôt qu'un matching de mots.
+
+    Le plafond du contenu (40) est volontairement inférieur au seuil "pertinent"
+    (55, voir classify_by_investigation_relevance) : une image ne peut donc
+    jamais être classée pertinente sur son seul contenu, même avec de
+    nombreuses catégories détectées. C'est le correctif à l'ancien système où
+    le score de contenu seul saturait déjà à 100 et rendait le contexte
+    décoratif. Sans contexte fourni, le score de contexte vaut 0.
     """
-    score = 0
     description = analysis.get("description", "").lower()
     categories = analysis.get("categories", [])
-    tags = analysis.get("tags", [])
-    
-    print(f"\n=== Scoring image: {analysis.get('filename', 'unknown')} ===")
-    print(f"Description: {description}")
-    print(f"Categories: {categories}")
-    print(f"Tags: {tags}")
-    
-    # Score de base selon catégories (TOUJOURS APPLICABLE)
-    base_score = 0
-    critical_categories = {
-        "people": 25,      # Personnes = très pertinent
-        "weapons": 45,     # Armes = extrêmement pertinent
-        "vehicles": 22,    # Véhicules = pertinent
-        "documents": 28,   # Documents = très pertinent
-        "buildings": 18,   # Lieux = pertinent
-        "indoor": 15,      # Intérieur = moyennement pertinent
-        "outdoor": 15,     # Extérieur = moyennement pertinent
-        "objects": 12      # Objets = pertinent
+
+    # --- Score de CONTENU (0-40) ---
+    category_points = {
+        "weapons": 15, "documents": 9, "people": 8, "vehicles": 7,
+        "buildings": 6, "indoor": 5, "outdoor": 5, "objects": 4,
+        "animals": 3, "advertising": 3,
     }
-    
-    for cat, points in critical_categories.items():
-        if cat in categories:
-            base_score += points
-            print(f"  Category '{cat}': +{points} points")
-    
-    score += base_score
-    
-    # Bonus catégories multiples (image riche)
-    if len(categories) >= 3:
-        bonus = 15
-        score += bonus
-        print(f"  Multiple categories bonus: +{bonus} points")
-    
-    # Tags importants
-    tag_score = 0
-    important_tags = ["people", "vehicles", "documents", "weapons", "buildings"]
-    for tag in tags:
-        if tag in important_tags:
-            tag_score += 8
-    if tag_score > 0:
-        score += tag_score
-        print(f"  Important tags: +{tag_score} points")
-    
-    # Description détaillée
+    content_score = sum(category_points.get(cat, 0) for cat in categories)
+
     word_count = len(description.split())
     if word_count > 10:
-        score += 12
-        print(f"  Detailed description: +12 points")
+        content_score += 8
     elif word_count > 6:
-        score += 6
-        print(f"  Medium description: +6 points")
-    
-    # SI CONTEXTE FOURNI : Analyse sémantique approfondie
-    if contexte_enquete and len(contexte_enquete.strip()) > 10:
-        contexte_lower = contexte_enquete.lower()
-        
-        # Nettoyer et extraire mots significatifs du contexte
-        stop_words = {"le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "dans", "sur", "avec", "pour", "par"}
-        contexte_words = [w for w in contexte_lower.split() if len(w) > 3 and w not in stop_words]
-        
-        print(f"  Context words to match: {contexte_words[:20]}")
-        
-        # 1. Correspondance exacte des mots-clés (POIDS TRÈS FORT)
-        exact_matches = 0
-        for word in contexte_words[:20]:  # Top 20 mots du contexte
-            if word in description:
-                exact_matches += 1
-                score += 12  # +12 points par correspondance exacte
-        
-        if exact_matches > 0:
-            print(f"  Exact word matches: {exact_matches} words → +{exact_matches * 12} points")
-        
-        # 2. Correspondance partielle (mots racines, préfixes)
-        partial_matches = 0
-        for word in contexte_words[:20]:
-            # Vérifier les correspondances partielles (au moins 4 caractères communs)
-            if len(word) >= 4:
-                for desc_word in description.split():
-                    if len(desc_word) >= 4:
-                        # Correspondance de début de mot (préfixe commun)
-                        if word[:4] in desc_word or desc_word[:4] in word:
-                            partial_matches += 1
-                            score += 6  # +6 points par correspondance partielle
-                            break
-        
-        if partial_matches > 0:
-            print(f"  Partial matches: {partial_matches} → +{partial_matches * 6} points")
-        
-        # 3. Correspondance sémantique via catégories mentionnées dans contexte
-        semantic_bonus = 0
-        category_keywords = {
-            "people": ["personne", "homme", "femme", "suspect", "témoin", "individu", "gens"],
-            "vehicles": ["voiture", "véhicule", "auto", "moto", "camion", "transport"],
-            "weapons": ["arme", "pistolet", "couteau", "fusil", "dangereux"],
-            "documents": ["document", "papier", "texte", "écrit", "lettre", "note"],
-            "buildings": ["bâtiment", "maison", "immeuble", "structure", "lieu"],
-            "outdoor": ["extérieur", "dehors", "rue", "route", "parc"],
-            "indoor": ["intérieur", "dedans", "pièce", "salle", "chambre"]
-        }
-        
-        for cat, keywords in category_keywords.items():
-            if cat in categories:
-                for keyword in keywords:
-                    if keyword in contexte_lower:
-                        semantic_bonus += 15
-                        print(f"  Semantic match '{cat}' via '{keyword}': +15 points")
-                        break
-        
-        score += semantic_bonus
-        
-        # 4. Bonus si beaucoup de correspondances (contexte très pertinent)
-        if exact_matches >= 3:
-            high_relevance_bonus = 20
-            score += high_relevance_bonus
-            print(f"  High relevance bonus: +{high_relevance_bonus} points")
-        elif exact_matches >= 2:
-            score += 10
-            print(f"  Medium relevance bonus: +10 points")
-    else:
-        print("  No context provided, using base scoring only")
-    
-    # Normaliser entre 0 et 100
-    final_score = min(100, max(0, score))
-    print(f"  FINAL SCORE: {final_score}/100\n")
-    
-    return final_score
+        content_score += 4
+
+    content_score = min(CONTENT_SCORE_MAX, content_score)
+
+    # --- Score de CONTEXTE (0-60) ---
+    has_context = bool(contexte_enquete and contexte_enquete.strip())
+    context_score = 0.0
+    if has_context and description:
+        description_embedding = _get_semantic_model().encode(description, convert_to_tensor=True)
+        context_embedding = _get_context_embedding(contexte_enquete)
+        cosine = util.cos_sim(description_embedding, context_embedding).item()
+        context_score = max(0.0, min(1.0, cosine)) * CONTEXT_SCORE_MAX
+
+    final_score = round(content_score + context_score)
+
+    print(
+        f"Scoring '{analysis.get('filename', 'unknown')}': "
+        f"contenu={content_score:.1f}/{CONTENT_SCORE_MAX}, "
+        f"contexte={context_score:.1f}/{CONTEXT_SCORE_MAX} (fourni={has_context}), "
+        f"total={final_score}/100"
+    )
+
+    return max(0, min(100, final_score))
 
 def classify_by_investigation_relevance(score: int) -> str:
     """
-    Classifie une image selon son score de pertinence
-    Seuils ajustés pour le nouveau système de scoring :
-    Pertinent: score >= 55
-    À traiter: 25 <= score < 55
-    Non pertinent: score < 25
+    Classifie une image selon son score de pertinence (0-100).
+    Seuils choisis pour l'échelle contenu(0-40) + contexte(0-60) :
+    - Pertinent (score >= 55) : dépasse le contenu maximal seul (40), donc
+      exige une similarité de contexte significative, pas juste du contenu.
+    - À traiter (25 <= score < 55)
+    - Non pertinent (score < 25)
     """
     if score >= 55:
         return "pertinent"
@@ -1732,7 +1768,7 @@ def classify_by_investigation_relevance(score: int) -> str:
     else:
         return "non_pertinent"
 
-def page_analyse_sort_all(current_state):
+def page_analyse_sort_all(current_state, progress: gr.Progress = gr.Progress()):
     """
     Trie toutes les images selon leur pertinence pour l'enquête
     """
@@ -1742,32 +1778,43 @@ def page_analyse_sort_all(current_state):
             ℹ️ Aucune image n'a été importée. Commencez par la page <strong>Accueil</strong> pour uploader des images.
         </div>
         """, current_state, {}
-    
+
     # S'assurer que les images sont analysées
     if len(current_state.analyses) < len(current_state.images):
-        current_state = analyze_all_images(current_state)
+        current_state = analyze_all_images(current_state, progress=progress)
     
     # Calculer le score de pertinence pour chaque image
     contexte = current_state.enquete_info.get("contexte", "")
+    has_context = bool(contexte and contexte.strip())
     relevance_counts = {"pertinent": 0, "a_traiter": 0, "non_pertinent": 0}
-    
+
     for idx, analysis in current_state.analyses.items():
         # Calculer le score de pertinence
         relevance_score = calculate_investigation_relevance_score(analysis, contexte)
         relevance_category = classify_by_investigation_relevance(relevance_score)
-        
+
         # Stocker dans l'analyse
         analysis["relevance_score"] = relevance_score
         analysis["relevance_category"] = relevance_category
-        
+
         relevance_counts[relevance_category] += 1
-        
+
         print(f"Image {idx}: score={relevance_score}, category={relevance_category}")
-    
+
     # Notification de succès
     gr.Info(f"✅ {len(current_state.images)} image(s) triée(s) par pertinence ! 🟢 Pertinentes: {relevance_counts['pertinent']} | 🟡 À traiter: {relevance_counts['a_traiter']} | 🔴 Non pertinentes: {relevance_counts['non_pertinent']}")
-    
-    return "", current_state, relevance_counts
+
+    # Sans contexte, le score ne reflète que le contenu de l'image (plafonné à
+    # 40/100) : on le dit explicitement plutôt que de laisser un score muet.
+    status_html = ""
+    if not has_context:
+        status_html = """
+        <div class="info-message" style="border-color: #dc3545; color: #dc3545;">
+            ⚠️ Aucun contexte d'enquête défini : le score de pertinence ne reflète que le <strong>contenu</strong> de l'image (catégories, description), plafonné à 40/100, pas sa pertinence pour une enquête précise. Définissez un contexte dans l'onglet <strong>Accueil</strong> pour un tri fiable.
+        </div>
+        """
+
+    return status_html, current_state, relevance_counts
 
 def page_analyse_filter_by_relevance(relevance_category: str, current_state):
     """
@@ -1863,11 +1910,11 @@ def page_analyse_filter_by_relevance(relevance_category: str, current_state):
                     </span>
                     """
         
-        # Générer l'aperçu de l'image
+        # Générer l'aperçu de l'image (à la volée depuis le disque)
         image_preview = ""
-        if "image" in analysis and analysis["image"] is not None:
+        if analysis.get("path"):
             try:
-                image_base64 = pil_to_base64(analysis["image"], max_size=(300, 300))
+                image_base64 = pil_to_base64_from_path(analysis["path"], max_size=(300, 300))
                 if image_base64:
                     image_preview = f"""
                     <div style="margin: 10px 0; text-align: center;">
@@ -2234,13 +2281,15 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
             Cette page vous permet de trier toutes les images selon leur **pertinence pour l'enquête** en fonction du contexte que vous avez défini.
             
             ### 🎯 Système de scoring de pertinence :
-            - **Score basé sur le contexte** de l'enquête (correspondance sémantique avancée)
-            - **Analyse multi-critères** : catégories, description, correspondances exactes et partielles
+            - **Score de contenu** (0-40) : catégories détectées, richesse de la description — indépendant du contexte
+            - **Score de contexte** (0-60) : similarité sémantique (embeddings) entre la description et le contexte de l'enquête, pas un simple mot-clé
             - **3 niveaux de pertinence** :
-              - 🟢 **Pertinentes** (score ≥ 55) : Images hautement pertinentes
+              - 🟢 **Pertinentes** (score ≥ 55) : nécessite une similarité de contexte significative, le contenu seul ne suffit jamais
               - 🟡 **À traiter** (25-54) : Images nécessitant une analyse approfondie
               - 🔴 **Non pertinentes** (< 25) : Images probablement sans intérêt
-            
+
+            ⚠️ Sans contexte d'enquête défini (onglet Accueil), le score plafonne à 40/100 (contenu seul).
+
             Cliquez sur "Trier les images" puis sur une catégorie pour voir les images correspondantes.
             """)
             
@@ -2366,8 +2415,8 @@ with gr.Blocks(theme=gr.themes.Soft(), css=CUSTOM_CSS, title="IArgos - Système 
     - Pour un usage en production, déployez cette application en local
     
     ### 🧠 Technologies
-    - **Intelligence Artificielle** : 
-      - BLIP (Captioning + VQA) pour images
+    - **Intelligence Artificielle** :
+      - BLIP-2 (Captioning + VQA, quantization 4-bit) pour images
     - **Interface** : Gradio Multi-pages
     - **Version** : 2.5 - Analyse d'Images
     """)
