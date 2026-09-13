@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import base64
 import os
+import re
 import sqlite3
 import hashlib
 import time
@@ -56,6 +57,20 @@ def load_models():
         model = Blip2ForConditionalGeneration.from_pretrained(MODEL_NAME, torch_dtype=torch.float32).to(device)
 
     print(f"{MODEL_NAME} chargé avec succès !")
+
+# Modèle de similarité sémantique (léger, ~80 Mo, tourne sur CPU sans impact
+# sur la VRAM réservée à BLIP-2). Chargé une seule fois (lazy, au premier
+# appel), utilisé à deux endroits : la classification par catégorie
+# (categories_from_text) et le score de pertinence contexte
+# (calculate_investigation_relevance_score).
+_semantic_model = None
+
+def _get_semantic_model():
+    global _semantic_model
+    if _semantic_model is None:
+        print(" Chargement du modèle de similarité sémantique (all-MiniLM-L6-v2, CPU)...")
+        _semantic_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    return _semantic_model
 
 # ============================================================================
 # PERSISTANCE SQLITE - Reprise après interruption sur de gros lots d'images
@@ -1284,100 +1299,94 @@ def classify_image_by_category(image_data: dict, image_id: int) -> List[str]:
 
     return categories_from_text(description, vqa_answers)
 
+# Chaque catégorie est représentée par une phrase descriptive plutôt qu'un nom
+# ou une liste de mots-clés : la similarité sémantique capture le sens de la
+# description générée par BLIP-2 (texte libre, formulations imprévisibles),
+# là où une liste de mots-clés rate tout synonyme non anticipé ("handgun" si
+# seuls "gun"/"pistol" étaient listés, "a sharp metal object", etc.).
+CATEGORY_PROMPTS = {
+    "people": "one or more people, a man, woman or child",
+    "vehicles": "a vehicle such as a car, van, truck or motorcycle",
+    "weapons": "a weapon such as a knife, gun, blade or firearm",
+    "documents": "documents, papers, text, writing or signs",
+    "buildings": "a building, house or architectural structure",
+    "outdoor": "an outdoor scene, taken outside",
+    "indoor": "an indoor scene, taken inside a building",
+    "objects": "an object, item or piece of equipment",
+    "animals": "an animal such as a dog, cat or bird",
+    "advertising": "an advertisement, brand logo or commercial poster",
+}
+
+# Seuils de similarité cosinus par catégorie. NON CALIBRÉS : faute d'accès
+# réseau à COCO/HuggingFace dans l'environnement où ce code a été écrit, ces
+# valeurs sont des estimations raisonnables compte tenu de la plage typique
+# des cosinus MiniLM sur ce genre de phrases (~0.2-0.6, pas 0-1 : effet de
+# cône d'anisotropie des modèles de phrases). À recalibrer avec
+# scripts/evaluate.py sur le jeu COCO réel : F1-max par catégorie, sauf
+# "weapons" où il faut maximiser le recall sous une contrainte de precision
+# minimale (un faux négatif coûte plus cher qu'un faux positif).
+CATEGORY_COSINE_THRESHOLDS = {
+    "weapons": 0.32,     # priorité au recall : seuil bas assumé, quitte à sur-détecter
+    "people": 0.38,
+    "vehicles": 0.38,
+    "documents": 0.35,
+    "buildings": 0.35,
+    "outdoor": 0.32,
+    "indoor": 0.32,
+    "objects": 0.40,     # seuil plus élevé car catégorie très générique
+    "animals": 0.30,     # seuil bas : une mention claire doit suffire
+    "advertising": 0.38,
+}
+
+_category_prompt_embeddings_cache = {"names": None, "embeddings": None}
+
+def _get_category_prompt_embeddings():
+    """Encode les phrases de catégorie une seule fois (identiques pour toutes les images)"""
+    if _category_prompt_embeddings_cache["embeddings"] is None:
+        names = list(CATEGORY_PROMPTS.keys())
+        prompts = [CATEGORY_PROMPTS[name] for name in names]
+        _category_prompt_embeddings_cache["names"] = names
+        _category_prompt_embeddings_cache["embeddings"] = _get_semantic_model().encode(prompts, convert_to_tensor=True)
+    return _category_prompt_embeddings_cache["names"], _category_prompt_embeddings_cache["embeddings"]
+
 def categories_from_text(description: str, vqa_answers: List[str]) -> List[str]:
     """
     Déduit les catégories d'une image à partir d'une description et de réponses
     VQA déjà calculées (mutualisé entre le mode single-image et le mode batché
-    de l'analyse en masse). Retourne une liste de catégories (multi-label).
+    de l'analyse en masse), par similarité sémantique (cosinus MiniLM) contre
+    une phrase descriptive par catégorie. Retourne une liste de catégories
+    (multi-label).
     """
     combined_text = " ".join([description.lower()] + [a.lower() for a in vqa_answers])
+    combined_text = re.sub(r"[^\w\s]", " ", combined_text)
+    combined_text = re.sub(r"\s+", " ", combined_text).strip()
     categories_assigned = []
 
-    # Configuration des catégories : mots-clés cherchés dans description + réponses
-    category_analysis = {
-        "people": {
-            "keywords": ["person", "man", "woman", "people", "child", "boy", "girl", "human", "face", "crowd", "group"],
-            "weight": 1.0
-        },
-        "vehicles": {
-            "keywords": ["car", "vehicle", "truck", "motorcycle", "bike", "bus", "train", "automobile", "taxi", "van"],
-            "weight": 1.0
-        },
-        "weapons": {
-            "keywords": ["weapon", "gun", "knife", "rifle", "pistol", "blade", "sharp", "firearm", "cutting"],
-            "weight": 1.2
-        },
-        "documents": {
-            "keywords": ["document", "paper", "text", "sign", "writing", "letter", "book", "page", "note", "card", "words"],
-            "weight": 1.0
-        },
-        "buildings": {
-            "keywords": ["building", "house", "structure", "architecture", "wall", "door", "window", "roof", "facade"],
-            "weight": 1.0
-        },
-        "outdoor": {
-            "keywords": ["outdoor", "outside", "street", "road", "park", "sky", "nature", "exterior", "sidewalk"],
-            "weight": 0.8
-        },
-        "indoor": {
-            "keywords": ["indoor", "inside", "room", "interior", "ceiling", "floor", "furniture", "wall"],
-            "weight": 0.8
-        },
-        "objects": {
-            "keywords": ["object", "item", "thing", "tool", "equipment", "device", "bag", "box", "bottle", "holding"],
-            "weight": 0.7
-        },
-        "animals": {
-            "keywords": ["dog", "cat", "animal", "pet", "bird", "horse"],
-            "weight": 0.6  # Poids faible, généralement pas prioritaire pour enquêtes
-        },
-        "advertising": {
-            "keywords": ["advertisement", "ad", "brand", "logo", "commercial", "marketing", "poster", "billboard", "sign", "promotion"],
-            "weight": 0.5  # Poids faible, généralement pas prioritaire pour enquêtes
-        }
-    }
+    names, prompt_embeddings = _get_category_prompt_embeddings()
+    text_embedding = _get_semantic_model().encode(combined_text, convert_to_tensor=True)
+    similarities = util.cos_sim(text_embedding, prompt_embeddings)[0]
 
-    # 3. Scorer chaque catégorie selon le nombre de mots-clés trouvés
-    category_scores = {}
-
-    for category, config in category_analysis.items():
-        keyword_matches = sum(1 for keyword in config["keywords"] if keyword in combined_text)
-        score = (keyword_matches * 25) * config["weight"]
-        if keyword_matches > 0:
-            print(f"{category}: {keyword_matches} mot(s)-clé(s) trouvé(s) (score={score:.1f})")
-        category_scores[category] = score
-
-    # 4. Sélection des catégories avec seuil adaptatif
-    # Seuils différents selon la catégorie pour éviter faux positifs
-    category_thresholds = {
-        "weapons": 30,      # Seuil modéré pour weapons (équilibre détection/précision)
-        "people": 20,
-        "vehicles": 20,
-        "documents": 20,
-        "buildings": 20,
-        "outdoor": 15,
-        "indoor": 15,
-        "objects": 25,      # Seuil plus élevé car très générique
-        "animals": 15,      # Seuil bas : une seule mention (ex. "dog") doit suffire
-        "advertising": 20   # Seuil normal pour publicité
-    }
+    category_scores = {name: similarities[i].item() for i, name in enumerate(names)}
+    for category, score in category_scores.items():
+        if score >= CATEGORY_COSINE_THRESHOLDS.get(category, 0.35):
+            print(f"{category}: cosinus={score:.3f} (seuil={CATEGORY_COSINE_THRESHOLDS.get(category, 0.35)})")
 
     max_categories = 5
 
-    # Trier par score
+    # Trier par cosinus décroissant
     sorted_categories = sorted(category_scores.items(), key=lambda x: x[1], reverse=True)
 
     print(f"\nScores finaux:")
     for cat, score in sorted_categories:
-        threshold = category_thresholds.get(cat, 20)
-        print(f"  {cat}: {score:.1f} (seuil: {threshold})")
+        threshold = CATEGORY_COSINE_THRESHOLDS.get(cat, 0.35)
+        print(f"  {cat}: {score:.3f} (seuil: {threshold})")
 
     # Assigner les catégories au-dessus de leur seuil spécifique
     for category, score in sorted_categories:
-        threshold = category_thresholds.get(category, 20)
+        threshold = CATEGORY_COSINE_THRESHOLDS.get(category, 0.35)
         if score >= threshold and len(categories_assigned) < max_categories:
             categories_assigned.append(category)
-            print(f"  ✓ Assigned to {category} (score: {score:.1f}, threshold: {threshold})")
+            print(f"  ✓ Assigned to {category} (cosinus: {score:.3f}, threshold: {threshold})")
 
     # 5. Gérer les conflits indoor/outdoor
     if "indoor" in categories_assigned and "outdoor" in categories_assigned:
@@ -1670,20 +1679,10 @@ def page_categorisation_filter(category_id: str, current_state):
 # PAGE 5 : ANALYSE - Espace de travail avec tri pertinence enquête
 # ============================================================================
 
-# Modèle de similarité sémantique pour le score de contexte (léger, tourne sur
-# CPU sans impact sur la VRAM réservée à BLIP-2). Chargé une seule fois (lazy).
-_semantic_model = None
 # L'embedding du contexte d'enquête est identique pour toutes les images d'une
 # même enquête : on le calcule une fois et on le réutilise (invalidé si le
 # texte du contexte change).
 _context_embedding_cache = {"text": None, "embedding": None}
-
-def _get_semantic_model():
-    global _semantic_model
-    if _semantic_model is None:
-        print(" Chargement du modèle de similarité sémantique (all-MiniLM-L6-v2, CPU)...")
-        _semantic_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-    return _semantic_model
 
 def _get_context_embedding(contexte_enquete: str):
     """Encode le contexte d'enquête, avec cache (identique pour toutes les images)"""
