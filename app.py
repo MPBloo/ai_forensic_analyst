@@ -1349,6 +1349,28 @@ def _get_category_prompt_embeddings():
         _category_prompt_embeddings_cache["embeddings"] = _get_semantic_model().encode(prompts, convert_to_tensor=True)
     return _category_prompt_embeddings_cache["names"], _category_prompt_embeddings_cache["embeddings"]
 
+def build_working_text(description: str, vqa_answers: List[str]) -> str:
+    """
+    Construit le texte de travail : concatène la caption et les réponses VQA,
+    minuscules, ponctuation retirée. C'est la seule représentation de l'image
+    dont dispose la suite du pipeline (classification par catégorie).
+    """
+    combined_text = " ".join([description.lower()] + [a.lower() for a in vqa_answers])
+    combined_text = re.sub(r"[^\w\s]", " ", combined_text)
+    return re.sub(r"\s+", " ", combined_text).strip()
+
+def category_cosine_scores(working_text: str) -> Dict[str, float]:
+    """
+    Similarité cosinus (MiniLM) entre le texte de travail et la phrase
+    descriptive de chaque catégorie (CATEGORY_PROMPTS). Scores bruts, avant
+    seuillage — réutilisé par categories_from_text (production) et par
+    scripts/evaluate.py (calibration des seuils, comparaison lexical/sémantique).
+    """
+    names, prompt_embeddings = _get_category_prompt_embeddings()
+    text_embedding = _get_semantic_model().encode(working_text, convert_to_tensor=True)
+    similarities = util.cos_sim(text_embedding, prompt_embeddings)[0]
+    return {name: similarities[i].item() for i, name in enumerate(names)}
+
 def categories_from_text(description: str, vqa_answers: List[str]) -> List[str]:
     """
     Déduit les catégories d'une image à partir d'une description et de réponses
@@ -1357,16 +1379,10 @@ def categories_from_text(description: str, vqa_answers: List[str]) -> List[str]:
     une phrase descriptive par catégorie. Retourne une liste de catégories
     (multi-label).
     """
-    combined_text = " ".join([description.lower()] + [a.lower() for a in vqa_answers])
-    combined_text = re.sub(r"[^\w\s]", " ", combined_text)
-    combined_text = re.sub(r"\s+", " ", combined_text).strip()
+    working_text = build_working_text(description, vqa_answers)
     categories_assigned = []
 
-    names, prompt_embeddings = _get_category_prompt_embeddings()
-    text_embedding = _get_semantic_model().encode(combined_text, convert_to_tensor=True)
-    similarities = util.cos_sim(text_embedding, prompt_embeddings)[0]
-
-    category_scores = {name: similarities[i].item() for i, name in enumerate(names)}
+    category_scores = category_cosine_scores(working_text)
     for category, score in category_scores.items():
         if score >= CATEGORY_COSINE_THRESHOLDS.get(category, 0.35):
             print(f"{category}: cosinus={score:.3f} (seuil={CATEGORY_COSINE_THRESHOLDS.get(category, 0.35)})")
@@ -1717,17 +1733,17 @@ def calculate_investigation_relevance_score(analysis: dict, contexte_enquete: st
 
     # --- Score de CONTENU (0-40) ---
     category_points = {
-        "weapons": 15, "documents": 9, "people": 8, "vehicles": 7,
-        "buildings": 6, "indoor": 5, "outdoor": 5, "objects": 4,
-        "animals": 3, "advertising": 3,
+        "people": 8, "documents": 8, "weapons": 8, "vehicles": 8,
+        "buildings": 5, "objects": 4, "indoor": 3, "outdoor": 3,
+        "animals": 1, "advertising": 0,
     }
     content_score = sum(category_points.get(cat, 0) for cat in categories)
 
     word_count = len(description.split())
     if word_count > 10:
-        content_score += 8
-    elif word_count > 6:
-        content_score += 4
+        content_score += 6
+    elif word_count >= 6:
+        content_score += 3
 
     content_score = min(CONTENT_SCORE_MAX, content_score)
 

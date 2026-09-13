@@ -7,18 +7,26 @@ Ce document décrit la méthodologie d'évaluation de `classify_image_by_categor
 
 Mesurer, de façon reproductible, la qualité de la catégorisation d'images de
 l'application — en particulier sur `weapons`, la catégorie à plus fort coût
-de faux positif dans un contexte judiciaire — et comparer deux approches de
-prompting VQA :
+de faux positif dans un contexte judiciaire — et isoler l'effet de **deux
+axes de design indépendants**, mesurés dans le même script plutôt que
+mélangés :
 
-- **vqa_closed** : l'ancienne approche (avant refactor), des questions
-  fermées type yes/no posées par catégorie (jusqu'à 4 questions ×
-  10 catégories).
-- **vqa_open** : l'approche actuelle, 3 questions ouvertes communes posées
-  une seule fois par image, catégories déduites par mots-clés dans les
-  réponses.
+- **questions** : `closed` (l'approche pré-refactor, des questions fermées
+  type yes/no posées par catégorie, jusqu'à 2 par catégorie sur 10
+  catégories) vs `open` (l'approche actuelle, 3 questions ouvertes communes
+  posées une seule fois par image).
+- **matching** : `lexical` (comptage de mots-clés pondéré, le mécanisme
+  utilisé par `app.py` avant son passage au cosinus) vs `semantic`
+  (similarité cosinus MiniLM entre le texte de travail et une phrase
+  descriptive par catégorie, le mécanisme actuel de
+  `app.categories_from_text`).
 
-Les deux configurations tournent sur le **même modèle BLIP-2** (4-bit) :
-la comparaison isole l'effet du style de questions, pas celui du modèle.
+`scripts/evaluate.py` exécute les 4 combinaisons (`closed_lexical`,
+`closed_semantic`, `open_lexical`, `open_semantic`), toutes sur le **même
+modèle BLIP-2** (4-bit) : `closed_lexical` est le système originel,
+`open_semantic` est le système actuel de `app.py`, et les deux autres
+cellules isolent chaque variable séparément (effet des questions seul à
+matching fixé, effet du matching seul à questions fixées).
 
 ## 2. Jeu de données
 
@@ -103,13 +111,26 @@ classe réelle) n'a pas de sens direct en multi-label. `evaluate.py` rapporte
 donc TP/FP/FN/TN **par catégorie**, l'équivalent standard et interprétable
 en multi-label.
 
-### 3.6 `vqa_closed` est une reconstruction, pas l'implémentation d'origine
+### 3.6 Les configs `closed_*` et `*_lexical` sont des reconstructions figées
 
-`classify_vqa_closed` (dans `evaluate.py`) reconstruit fidèlement l'esprit de
-l'ancienne approche (questions fermées par catégorie, scoring yes/no) mais
-avec un nombre de questions réduit (2 au lieu de jusqu'à 4 par catégorie)
-pour rester lisible. Le point de comparaison est le **style** de question
-(fermé vs ouvert), pas une reproduction bit-à-bit de l'ancien code.
+`CLOSED_CATEGORY_QUESTIONS` et `LEXICAL_CATEGORY_KEYWORDS`/`LEXICAL_THRESHOLDS`
+(dans `evaluate.py`) reconstruisent fidèlement l'esprit des mécanismes
+pré-refactor, mais avec un nombre de questions réduit (2 au lieu de jusqu'à
+4 par catégorie) pour rester lisibles, et sont **figés indépendamment** de
+l'évolution de `app.py` : si `app.py` change encore ses seuils ou son
+mécanisme, ces constantes ne suivent pas automatiquement. C'est voulu — le
+but est de comparer des points de référence stables, pas de traquer
+`app.py` en continu.
+
+### 3.7 La cellule `closed_semantic` n'a pas d'équivalent naturel
+
+Appliquer un cosinus sémantique à des réponses fermées type "yes"/"no" est
+un cas de figure qui n'a jamais existé dans une version réelle du projet :
+une réponse "yes" ou "no" isolée porte peu de signal sémantique par
+embedding (contrairement à un mot-clé exact comme "yes" qui, lui, matche
+littéralement). Cette cellule est incluse pour compléter le carré 2×2 et
+objectiver ce constat plutôt que l'affirmer sans preuve, mais un score
+dégradé sur `closed_semantic` n'est pas une surprise à traiter comme un bug.
 
 ## 4. Méthodologie d'exécution
 
@@ -117,32 +138,73 @@ pour rester lisible. Le point de comparaison est le **style** de question
 # 1. Construire le jeu d'évaluation (télécharge annotations + images COCO)
 python scripts/build_eval_set.py --n-images 200 --n-weapons-min 18
 
-# 2. Lancer l'évaluation comparative
-python scripts/evaluate.py --config both --output-markdown eval_results.md
+# 2. Lancer l'évaluation comparative (les 4 configurations)
+python scripts/evaluate.py --config all --output-markdown eval_results.md
+
+# 3. Calibrer les seuils sémantiques (F1 max, recall sous contrainte pour weapons)
+python scripts/evaluate.py --config open_semantic --calibrate-thresholds
 ```
 
 `evaluate.py` traite les images une par une (pas de batching) : l'objectif
-ici est de comparer le **nombre d'appels VQA** par approche (3 pour
-vqa_open, ~10-12 pour vqa_closed sur 6 catégories), pas de redémontrer le
-gain de débit du batching (voir `scripts/benchmark.py` pour ça).
+ici est de comparer le **nombre d'appels VQA** par approche (3 pour les
+configs `open_*`, ~15-18 pour les configs `closed_*` sur 10 catégories),
+pas de redémontrer le gain de débit du batching (voir `scripts/benchmark.py`
+pour ça).
 
-## 5. Résultats
+## 5. Calibration des seuils sémantiques
+
+`CATEGORY_COSINE_THRESHOLDS` (dans `app.py`) contrôle, par catégorie, le
+cosinus minimal pour assigner une catégorie. Les valeurs actuelles sont des
+**estimations non calibrées** (placeholders dans la plage réaliste des
+cosinus MiniLM, ~0.2-0.6 — voir `app.py`, ces valeurs sont commentées comme
+telles). `evaluate.py --calibrate-thresholds` :
+
+1. Exécute la config `*_semantic` demandée une seule fois (un passage
+   BLIP-2 + MiniLM par image), en gardant le cosinus **brut** par catégorie
+   pour chaque image (avant tout seuillage).
+2. Balaie ensuite, gratuitement (pur calcul sur les scores déjà obtenus,
+   pas de nouvel appel modèle), les seuils candidats de 0.20 à 0.60 par pas
+   de 0.01.
+3. Retient, par catégorie, le seuil qui **maximise le F1** — sauf
+   `weapons`, où c'est le seuil qui **maximise le recall sous une
+   contrainte de precision minimale** (`--weapons-precision-floor`, défaut
+   0.50) : un faux négatif (arme non détectée) coûte plus cher qu'un faux
+   positif (fausse alerte, quelques secondes de vérification) dans un
+   contexte judiciaire — l'asymétrie doit se lire dans le critère
+   d'optimisation, pas seulement dans le discours.
+
+Si aucun seuil ne respecte la contrainte de precision sur l'échantillon
+fourni, le script le signale explicitement (`N/A`) plutôt que de renvoyer
+une valeur qui ne respecte pas la contrainte demandée.
+
+**Cette calibration est spécifique à l'échantillon COCO utilisé** (dont le
+sur-échantillonnage de `weapons`, voir 2.2, le rend déjà non représentatif).
+Les seuils obtenus sont un point de départ raisonnable, pas une valeur à
+transférer telle quelle sur un corpus d'enquête réel — ils devraient être
+recalibrés dès que des données réelles (même en petit nombre) sont
+disponibles.
+
+## 6. Résultats
 
 **Non exécuté** : ce travail a été fait dans un environnement sans GPU et
 sans accès réseau à `cocodataset.org`/`huggingface.co` (bloqués par la
 politique réseau du sandbox), donc ni le téléchargement de COCO ni
-l'inférence BLIP-2 n'ont pu être testés en conditions réelles ici.
+l'inférence BLIP-2/MiniLM n'ont pu être testés en conditions réelles ici.
 
 Toute la logique (mapping, échantillonnage stratifié, calcul precision/
 recall/F1, gestion des cas N/A pour éviter les divisions par zéro, focus
-weapons, génération du tableau comparatif) a été vérifiée avec des scripts
-qui mockent BLIP-2 et un faux jeu de données COCO — voir les tests
-utilisés pendant le développement (non inclus dans le repo, exécutés en
-session). Elle n'a **pas** été validée avec le vrai modèle ni sur GPU.
+weapons, génération du tableau comparatif, balayage de seuils et gestion du
+cas où la contrainte de precision est inatteignable) a été vérifiée avec
+des scripts qui mockent BLIP-2/MiniLM et un faux jeu de données COCO — voir
+les tests utilisés pendant le développement (non inclus dans le repo,
+exécutés en session). Elle n'a **pas** été validée avec le vrai modèle ni
+sur GPU.
 
-**À faire avant de présenter ce travail** : exécuter les deux commandes
-ci-dessus sur une machine avec GPU (~4 Go VRAM) et accès internet, puis
-coller ici le tableau généré (`eval_results.md`) et les cas de faux
-positifs/négatifs sur `weapons` affichés par `--config both`.
+**À faire avant de présenter ce travail** : exécuter les trois commandes
+ci-dessus sur une machine avec GPU (~4 Go VRAM) et accès internet, coller
+ici le tableau comparatif 4 configurations (`eval_results.md`), les cas de
+faux positifs/négatifs sur `weapons` affichés par `--config all`, et les
+seuils calibrés — puis reporter ces seuils dans `CATEGORY_COSINE_THRESHOLDS`
+(`app.py`) si les résultats sont jugés fiables.
 
 <!-- Coller ici le tableau comparatif markdown généré par evaluate.py -->
